@@ -22,9 +22,10 @@ from PyQt6.QtGui import QFont, QColor, QPixmap, QPainter, QPainterPath, QPen, QL
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
 
 # URL do Web App do Google Apps Script (termina em "/exec").
-GOOGLE_SHEETS_WEBHOOK_URL = "GOOGLE_SHEETS_WEBHOOK_URL"
+GOOGLE_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzG0MwJ3miFutupkYbY-jIlovE-TkXbVS0qBNRpXTx_No5nbA_67JUOl6orr6042-bjyw/exec"
 
 # Cada empresa tem: nome, cor principal, cor do texto sobre essa cor, e o
 # caminho da logo (ou None para usar um ícone/texto).
@@ -115,6 +116,41 @@ def obter_ultima_compra(linhas_produto: list):
         if data_qd.isValid() and (melhor_data is None or data_qd > melhor_data):
             melhor_data, melhor = data_qd, linha
     return melhor if melhor is not None else linhas_produto[-1]
+
+
+# --------------------------------------------------------------------------- #
+# Cache local (deixa a lista aparecer na hora, mesmo antes do Sheets responder)
+# --------------------------------------------------------------------------- #
+# Guardamos em disco a última lista de cada empresa. Ao abrir uma empresa, a
+# tabela é populada instantaneamente com o que está em cache, e uma busca
+# real ao Sheets roda em paralelo pra atualizar tudo assim que chegar.
+# Isso não resolve lentidão do Apps Script em si, mas tira o "tempo de
+# espera" da experiência do usuário na maioria das vezes.
+
+def _cache_arquivo(empresa: str) -> str:
+    nome_seguro = "".join(c if c.isalnum() else "_" for c in empresa)
+    return os.path.join(CACHE_DIR, f"{nome_seguro}.json")
+
+
+def cache_carregar(empresa: str):
+    """Retorna a lista de linhas em cache, ou None se não houver cache válido."""
+    caminho = _cache_arquivo(empresa)
+    if not os.path.exists(caminho):
+        return None
+    try:
+        with open(caminho, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def cache_salvar(empresa: str, linhas: list):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(_cache_arquivo(empresa), "w", encoding="utf-8") as f:
+            json.dump(linhas, f, ensure_ascii=False)
+    except OSError:
+        pass  # cache é só otimização; se falhar, seguimos sem ele
 
 
 # --------------------------------------------------------------------------- #
@@ -387,9 +423,18 @@ class ProductEntriesPage(QWidget):
         self._carregando = False
         self._operacao_em_andamento = False
         self._worker = None
+        # Marcada quando a MainWindow decide destruir esta página (por
+        # exemplo, ao abrir outro produto). Todo callback de rede que chega
+        # depois disso deve simplesmente ignorar o resultado, em vez de
+        # tentar mexer em widgets que já não existem mais (isso é o que
+        # causava o "RuntimeError: wrapped C/C++ object ... has been deleted").
+        self._destruida = False
 
         self._montar_ui()
         self._popular_tabela(linhas_iniciais)
+
+    def marcar_destruida(self):
+        self._destruida = True
 
     def _montar_ui(self):
         layout = QVBoxLayout(self)
@@ -428,14 +473,14 @@ class ProductEntriesPage(QWidget):
 
     def _criar_linha_titulo(self) -> QHBoxLayout:
         linha = QHBoxLayout()
-        btn_voltar = QPushButton("← Voltar")
-        btn_voltar.clicked.connect(lambda: self.voltar_callback())
+        self.btn_voltar = QPushButton("← Voltar")
+        self.btn_voltar.clicked.connect(lambda: self.voltar_callback())
 
         bloco_esquerdo_widget = QWidget()
         bloco_esquerdo = QHBoxLayout(bloco_esquerdo_widget)
         bloco_esquerdo.setContentsMargins(0, 0, 0, 0)
         bloco_esquerdo.setSpacing(10)
-        bloco_esquerdo.addWidget(btn_voltar)
+        bloco_esquerdo.addWidget(self.btn_voltar)
         bloco_esquerdo.addSpacing(14)
 
         self.label_melhor_compra = QLabel("Melhor compra: -")
@@ -530,9 +575,11 @@ class ProductEntriesPage(QWidget):
         )
 
     def _definir_ocupado(self, ocupado: bool, mensagem: str = ""):
-        """Bloqueia os botões enquanto uma chamada de rede está em andamento."""
+        """Bloqueia os botões enquanto uma chamada de rede está em andamento.
+        Inclui o botão Voltar: sair da tela no meio de um salvamento/remoção
+        era justamente o que deixava a página órfã e causava o crash."""
         self._operacao_em_andamento = ocupado
-        for botao in (self.btn_add, self.btn_remover, self.btn_salvar, self.btn_recarregar):
+        for botao in (self.btn_add, self.btn_remover, self.btn_salvar, self.btn_recarregar, self.btn_voltar):
             botao.setEnabled(not ocupado)
         if mensagem:
             self.status_label.setStyleSheet("color: #d9a441;")
@@ -604,6 +651,8 @@ class ProductEntriesPage(QWidget):
         self._worker.start()
 
     def _on_remocao_concluida(self, sucesso: bool, mensagem, row: int):
+        if self._destruida:
+            return  # a página já foi fechada/trocada enquanto a rede respondia
         self._definir_ocupado(False)
         if sucesso:
             self.tabela.removeRow(row)
@@ -741,6 +790,8 @@ class ProductEntriesPage(QWidget):
         self._worker.start()
 
     def _on_salvamento_concluido(self, sucesso: bool, mensagem, linhas_por_id_novo: dict):
+        if self._destruida:
+            return  # a página já foi fechada/trocada enquanto a rede respondia
         self._definir_ocupado(False)
         if sucesso:
             self._carregando = True
@@ -765,6 +816,8 @@ class ProductEntriesPage(QWidget):
         self._worker.start()
 
     def _on_recarregamento_concluido(self, sucesso: bool, resultado):
+        if self._destruida:
+            return  # a página já foi fechada/trocada enquanto a rede respondia
         self._definir_ocupado(False)
         if not sucesso:
             self.status_label.setStyleSheet("color: #c0392b;")
@@ -905,9 +958,23 @@ class ProductListPage(QWidget):
     def recarregar(self):
         if self._operacao_em_andamento:
             return
+
+        # 1) Mostra na hora o que já temos em cache local, sem esperar a rede.
+        dados_cache = cache_carregar(self.empresa["nome"])
+        if dados_cache:
+            self._linhas_por_produto = {}
+            for linha in dados_cache:
+                self._linhas_por_produto.setdefault(linha["produto"], []).append(linha)
+            self._produtos_pendentes = [p for p in self._produtos_pendentes if p not in self._linhas_por_produto]
+            self._reconstruir_tabela()
+            self.dica_label.setStyleSheet("color: #999;")
+            self.dica_label.setText("Mostrando dados salvos localmente — atualizando com o Google Sheets...")
+        else:
+            self.dica_label.setStyleSheet("color: #999;")
+            self.dica_label.setText("Carregando produtos do Google Sheets...")
+
+        # 2) Em paralelo, busca a versão atual no Sheets pra confirmar/atualizar.
         self._definir_ocupado(True)
-        self.dica_label.setStyleSheet("color: #999;")
-        self.dica_label.setText("Carregando produtos do Google Sheets...")
 
         self._geracao_carregamento = getattr(self, "_geracao_carregamento", 0) + 1
         geracao_desta_chamada = self._geracao_carregamento
@@ -936,9 +1003,15 @@ class ProductListPage(QWidget):
             return  # o watchdog já assumiu o controle (resposta chegou tarde demais)
         self._definir_ocupado(False)
         if not sucesso:
-            self.dica_label.setText(f"Erro ao carregar do Google Sheets: {resultado}")
-            self.dica_label.setStyleSheet("color: #c0392b;")
-            QMessageBox.critical(self, "Erro ao carregar do Google Sheets", str(resultado))
+            # Se já tínhamos dados de cache na tela, mantemos eles visíveis e
+            # só avisamos que a atualização falhou — melhor que apagar tudo.
+            if self._linhas_por_produto:
+                self.dica_label.setStyleSheet("color: #c0392b;")
+                self.dica_label.setText(f"Não consegui atualizar do Sheets agora: {resultado}")
+            else:
+                self.dica_label.setText(f"Erro ao carregar do Google Sheets: {resultado}")
+                self.dica_label.setStyleSheet("color: #c0392b;")
+                QMessageBox.critical(self, "Erro ao carregar do Google Sheets", str(resultado))
             return
 
         self.dica_label.setStyleSheet("color: #999;")
@@ -954,6 +1027,7 @@ class ProductListPage(QWidget):
             p for p in self._produtos_pendentes if p not in self._linhas_por_produto
         ]
 
+        cache_salvar(self.empresa["nome"], resultado)
         self._reconstruir_tabela()
 
     def _reconstruir_tabela(self):
@@ -1184,6 +1258,10 @@ class MainWindow(QMainWindow):
             voltar_callback=lambda: self.voltar_para_lista_produtos(empresa),
         )
         if self._pagina_entradas_atual is not None:
+            # Avisa a página antiga que ela está de saída ANTES de destruí-la,
+            # pra qualquer worker de rede ainda em voo saber que deve ignorar
+            # o resultado em vez de tentar atualizar widgets já apagados.
+            self._pagina_entradas_atual.marcar_destruida()
             self.stack.removeWidget(self._pagina_entradas_atual)
             self._pagina_entradas_atual.deleteLater()
 

@@ -1,10 +1,12 @@
 # 📖 Documentação Técnica — Controle de Empresas
 
-> Explicação passo a passo de como o código de `controle_empresas.py` funciona por dentro: cada bloco, classe e função, na ordem em que aparecem no arquivo.
+> Explicação passo a passo de como o código de `controle_empresas.py` (e do backend `apps_script_backend.gs`) funciona por dentro: cada bloco, classe e função, na ordem em que aparecem no arquivo.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![PyQt6](https://img.shields.io/badge/GUI-PyQt6-41CD52?logo=qt&logoColor=white)
 ![Arquitetura](https://img.shields.io/badge/Arquitetura-MVC%20simplificado-9b59b6)
+
+> **Changelog desta versão:** correção de um crash (`RuntimeError: wrapped C/C++ object ... has been deleted`) causado por respostas de rede chegando depois que uma tela já tinha sido fechada; cache local em disco para a lista de produtos aparecer instantaneamente; e otimizações no backend Apps Script (cache de leitura, escrita em lote, índice de IDs) para acelerar listas grandes. Tudo isso está documentado nas seções marcadas com 🆕.
 
 ---
 
@@ -14,14 +16,16 @@
 2. [Configuração inicial](#2-configuração-inicial)
 3. [Funções utilitárias](#3-funções-utilitárias)
 4. [Integração com o Google Sheets](#4-integração-com-o-google-sheets)
-5. [Avatares circulares das empresas](#5-avatares-circulares-das-empresas)
-6. [Mini gráfico de tendência de preço](#6-mini-gráfico-de-tendência-de-preço)
-7. [Página 3 — Compras de um produto](#7-página-3--compras-de-um-produto-producteentriespage)
-8. [Página 2 — Lista de produtos](#8-página-2--lista-de-produtos-productlistpage)
-9. [Página 1 — Seleção de empresa](#9-página-1--seleção-de-empresa-companyselectpage)
-10. [Janela principal e navegação](#10-janela-principal-e-navegação-mainwindow)
-11. [Fluxo completo de uma tela até a outra](#11-fluxo-completo-de-uma-tela-até-a-outra)
-12. [Ponto de entrada (`main`)](#12-ponto-de-entrada-main)
+5. [Cache local em disco 🆕](#5-cache-local-em-disco-)
+6. [Avatares circulares das empresas](#6-avatares-circulares-das-empresas)
+7. [Mini gráfico de tendência de preço](#7-mini-gráfico-de-tendência-de-preço)
+8. [Página 3 — Compras de um produto](#8-página-3--compras-de-um-produto-producteentriespage)
+9. [Página 2 — Lista de produtos](#9-página-2--lista-de-produtos-productlistpage)
+10. [Página 1 — Seleção de empresa](#10-página-1--seleção-de-empresa-companyselectpage)
+11. [Janela principal e navegação](#11-janela-principal-e-navegação-mainwindow)
+12. [Fluxo completo de uma tela até a outra](#12-fluxo-completo-de-uma-tela-até-a-outra)
+13. [Ponto de entrada (`main`)](#13-ponto-de-entrada-main)
+14. [Backend Apps Script (`apps_script_backend.gs`) 🆕](#14-backend-apps-script-apps_script_backendgs-)
 
 ---
 
@@ -29,7 +33,7 @@
 
 O app segue uma ideia parecida com **MVC**, mas simplificada:
 
-- **Modelo** → a planilha do Google Sheets (não existe banco local).
+- **Modelo** → a planilha do Google Sheets (não existe banco local "de verdade" — o que existe agora é só um cache leve em disco, ver [Seção 5](#5-cache-local-em-disco-)).
 - **Controlador** → as funções `sheets_buscar`, `sheets_salvar`, `sheets_remover` e a classe `SheetsWorker`, que fazem a ponte entre a interface e a planilha.
 - **Visão** → quatro "páginas" (widgets do PyQt6), empilhadas dentro de um `QStackedWidget`, que o usuário navega como se fossem telas de um app mobile:
 
@@ -39,9 +43,11 @@ CompanySelectPage  →  ProductListPage  →  ProductEntriesPage
    empresa)             produtos)            compras do produto)
 ```
 
-Um ponto importante: **nenhuma tela guarda estado permanente sozinha**. Sempre que o usuário volta ou reabre uma tela, o app dispara uma nova busca no Sheets — isso evita mostrar dados desatualizados se a planilha mudou entre uma visita e outra.
+Um ponto importante: **nenhuma tela guarda estado permanente sozinha**. Sempre que o usuário volta ou reabre uma tela, o app dispara uma nova busca no Sheets — isso evita mostrar dados desatualizados se a planilha mudou entre uma visita e outra. 🆕 Desde a versão atual, essa busca é precedida por uma leitura instantânea do **cache local** (ver Seção 5), então a tela não fica mais "em branco" enquanto espera a rede.
 
 Como toda chamada de rede pode demorar, ela **nunca roda na thread principal da interface** (que travaria a janela). Em vez disso, cada chamada roda dentro de uma `QThread` (a classe `SheetsWorker`), e o resultado chega de volta através de um **sinal Qt** (`pyqtSignal`).
+
+🆕 **Sobre o ciclo de vida das telas:** como cada `SheetsWorker` roda em paralelo e pode terminar depois que a tela que o criou já foi fechada (por exemplo, o usuário voltou e abriu outro produto antes da resposta do "Salvar" chegar), a `ProductEntriesPage` agora rastreia explicitamente se ela já foi destruída, e ignora qualquer resultado de rede que chegue depois disso. Isso é detalhado na [Seção 8](#8-página-3--compras-de-um-produto-producteentriespage).
 
 ---
 
@@ -50,11 +56,13 @@ Como toda chamada de rede pode demorar, ela **nunca roda na thread principal da 
 ```python
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+CACHE_DIR = os.path.join(BASE_DIR, "cache")  # 🆕
 
 GOOGLE_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/.../exec"
 ```
 
 - `BASE_DIR` descobre a pasta onde o próprio arquivo `.py` está, e `ASSETS_DIR` aponta para a subpasta `assets/`, onde ficam as logos das empresas. Usar `__file__` em vez de um caminho fixo garante que o app funcione independente de onde ele for executado.
+- 🆕 `CACHE_DIR` aponta para uma subpasta `cache/`, criada automaticamente na primeira vez que o app salva alguma coisa em cache (ver [Seção 5](#5-cache-local-em-disco-)). Ela guarda um arquivo `.json` por empresa.
 - `GOOGLE_SHEETS_WEBHOOK_URL` é a **única "porta de entrada"** do app para os dados. Todo o resto do código depende dessa URL estar configurada corretamente.
 
 ```python
@@ -227,7 +235,7 @@ def sheets_buscar(empresa: str = None) -> list:
     return linhas
 ```
 
-Faz um `GET` na planilha. Se um nome de empresa for passado, ele é adicionado como parâmetro na URL (`?empresa=Narua`), para o Apps Script já devolver só os registros daquela empresa. Depois de receber a resposta, aplica `normalizar_data_sheets` em todas as linhas, garantindo que a data já chegue pronta pro resto do app usar. Usa timeout de 40s (maior que o padrão de 20s), já que listar pode demorar mais em planilhas grandes.
+Faz um `GET` na planilha. Se um nome de empresa for passado, ele é adicionado como parâmetro na URL (`?empresa=Narua`), para o Apps Script já devolver só os registros daquela empresa. 🆕 Do lado do Apps Script, essa resposta agora normalmente vem de um **cache de 60 segundos** em vez de reler a planilha inteira a cada chamada (ver [Seção 14](#14-backend-apps-script-apps_script_backendgs-)) — o Python não precisa saber disso, mas é por isso que buscas repetidas em pouco tempo ficam bem mais rápidas. Depois de receber a resposta, `sheets_buscar` aplica `normalizar_data_sheets` em todas as linhas, garantindo que a data já chegue pronta pro resto do app usar. Usa timeout de 40s (maior que o padrão de 20s), já que listar pode demorar mais em planilhas grandes.
 
 ### `sheets_salvar(novas, existentes)`
 
@@ -237,7 +245,7 @@ def sheets_salvar(novas: list, existentes: list) -> None:
     _requisitar(GOOGLE_SHEETS_WEBHOOK_URL, dados=payload, metodo="POST")
 ```
 
-Envia um `POST` com duas listas: `novas` (linhas que ainda não existem na planilha — vão virar `append`) e `existentes` (linhas que já têm um ID e vão ser atualizadas). O Apps Script decide o que fazer com cada lista.
+Envia um `POST` com duas listas: `novas` (linhas que ainda não existem na planilha — vão virar gravação em lote) e `existentes` (linhas que já têm um ID e vão ser atualizadas). O Apps Script decide o que fazer com cada lista. 🆕 Do lado do Apps Script, as linhas novas agora são gravadas todas de uma vez (um único `setValues` em bloco) em vez de uma chamada por linha — ver Seção 14.
 
 ### `sheets_remover(ids)`
 
@@ -279,6 +287,8 @@ Quando termina (`run()`), ela emite o sinal `concluido` com dois valores:
 
 Cada tela do app "escuta" esse sinal conectando uma função a ele (`worker.concluido.connect(...)`), que roda de volta na thread principal — por isso é seguro atualizar a interface dentro dela.
 
+🆕 **Cuidado que essa arquitetura exige:** como o `SheetsWorker` roda em paralelo à interface, ele pode terminar **depois** que a tela que o criou já não existe mais (por exemplo, o usuário navegou pra outro lugar antes da resposta chegar). Se o callback conectado ao sinal tentar mexer em widgets que o Qt já destruiu, o resultado é um `RuntimeError: wrapped C/C++ object ... has been deleted`. A solução adotada foi dar à `ProductEntriesPage` uma flag `_destruida`, verificada no início de todo callback — ver [Seção 8](#8-página-3--compras-de-um-produto-producteentriespage).
+
 **Padrão de uso, repetido em todo o app:**
 ```python
 self._worker = SheetsWorker(sheets_buscar, self.empresa["nome"])
@@ -288,7 +298,55 @@ self._worker.start()
 
 ---
 
-## 5. Avatares circulares das empresas
+## 5. Cache local em disco 🆕
+
+Esse bloco é novo e existe só por um motivo: **fazer a tela aparecer com dados na hora**, mesmo antes do Google Sheets responder, em vez de mostrar "Carregando..." toda vez que uma empresa é aberta.
+
+### `_cache_arquivo(empresa)`
+
+```python
+def _cache_arquivo(empresa: str) -> str:
+    nome_seguro = "".join(c if c.isalnum() else "_" for c in empresa)
+    return os.path.join(CACHE_DIR, f"{nome_seguro}.json")
+```
+
+Monta o caminho do arquivo de cache de uma empresa, trocando qualquer caractere que não seja letra/número por `_` — assim nomes de empresa com espaços ou acentos não geram nomes de arquivo inválidos.
+
+### `cache_carregar(empresa)`
+
+```python
+def cache_carregar(empresa: str):
+    caminho = _cache_arquivo(empresa)
+    if not os.path.exists(caminho):
+        return None
+    try:
+        with open(caminho, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+```
+
+Lê o arquivo `.json` daquela empresa, se existir. Se o arquivo não existir, estiver corrompido ou der qualquer erro de leitura, devolve `None` silenciosamente — o cache é só uma otimização, então qualquer problema nele nunca deve impedir o app de funcionar (ele simplesmente cai de volta no comportamento de sempre buscar do Sheets).
+
+### `cache_salvar(empresa, linhas)`
+
+```python
+def cache_salvar(empresa: str, linhas: list):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(_cache_arquivo(empresa), "w", encoding="utf-8") as f:
+            json.dump(linhas, f, ensure_ascii=False)
+    except OSError:
+        pass
+```
+
+Grava a lista de linhas mais recente da empresa em disco, criando a pasta `cache/` se ainda não existir. É chamada logo depois de uma busca bem-sucedida no Sheets (dentro de `ProductListPage._on_carregamento_concluido`, ver [Seção 9](#9-página-2--lista-de-produtos-productlistpage)). Se a escrita falhar por qualquer motivo (disco cheio, sem permissão etc.), o erro é ignorado — de novo, o cache nunca deve derrubar o app.
+
+**Onde isso entra no fluxo:** quando `ProductListPage.recarregar()` é chamado, ele primeiro tenta `cache_carregar(...)` e, se achar algo, já popula a tabela imediatamente com esses dados (mostrando uma mensagem tipo "Mostrando dados salvos localmente — atualizando..."). Só depois disso ele dispara o `SheetsWorker` de verdade, que vai atualizar a tela com os dados reais assim que chegarem. Se a busca real falhar mas já havia dados de cache na tela, esses dados **continuam visíveis** — o usuário só é avisado que a atualização não funcionou, em vez de a tela ficar vazia.
+
+---
+
+## 6. Avatares circulares das empresas
 
 ### `recortar_em_circulo(pixmap_original, tamanho, zoom)`
 
@@ -306,7 +364,7 @@ Função de mais alto nível, usada na tela de seleção de empresa. Se a empres
 
 ---
 
-## 6. Mini gráfico de tendência de preço
+## 7. Mini gráfico de tendência de preço
 
 ### `MiniGraficoPreco` (QWidget)
 
@@ -328,7 +386,7 @@ Esse widget é usado dentro da tela de compras (`ProductEntriesPage`), alimentad
 
 ---
 
-## 7. Página 3 — Compras de um produto (`ProductEntriesPage`)
+## 8. Página 3 — Compras de um produto (`ProductEntriesPage`)
 
 Essa é a tela mais complexa do app: mostra e edita **todas as compras registradas de um produto específico**.
 
@@ -342,33 +400,52 @@ self.voltar_callback = voltar_callback
 self._carregando = False           # evita reagir a mudanças feitas pelo próprio código
 self._operacao_em_andamento = False  # bloqueia botões durante chamadas de rede
 self._worker = None
+self._destruida = False            # 🆕 ver abaixo
 ```
 
 O flag `_carregando` é importante: sempre que o código preenche a tabela programaticamente (ao abrir a tela, ao recarregar, etc.), ele é ligado antes e desligado depois. Isso evita que o evento `itemChanged` (disparado toda vez que uma célula muda, inclusive por código) recalcule totais e indicadores durante esse preenchimento — o recálculo só deve acontecer quando é o **usuário** editando.
 
+### 🆕 `_destruida` e `marcar_destruida()` — a correção do crash
+
+```python
+def marcar_destruida(self):
+    self._destruida = True
+```
+
+Esse é o ponto central da correção do erro `RuntimeError: wrapped C/C++ object of type QPushButton has been deleted`.
+
+**Como o crash acontecia:** a `MainWindow` cria uma `ProductEntriesPage` nova toda vez que o usuário abre um produto ([Seção 11](#11-janela-principal-e-navegação-mainwindow)), e destrói (`deleteLater()`) a página anterior. Se o usuário clicasse em "💾 Salvar", depois voltasse e abrisse outro produto **antes** da resposta do Sheets chegar, a página antiga era destruída com o `SheetsWorker` ainda rodando em segundo plano. Quando a resposta finalmente chegava, o callback (`_on_salvamento_concluido`) tentava reabilitar botões (`botao.setEnabled(...)`) de uma página que o Qt já tinha apagado da memória — e isso derrubava o programa.
+
+**A correção:** antes de destruir uma `ProductEntriesPage`, a `MainWindow` agora chama `pagina.marcar_destruida()` (ver [Seção 11](#11-janela-principal-e-navegação-mainwindow)). E todo callback de rede da página — `_on_remocao_concluida`, `_on_salvamento_concluido`, `_on_recarregamento_concluido` — começa assim:
+
+```python
+def _on_salvamento_concluido(self, sucesso, mensagem, linhas_por_id_novo):
+    if self._destruida:
+        return  # a página já foi fechada/trocada enquanto a rede respondia
+    ...
+```
+
+Ou seja: se a resposta chegar tarde demais, ela é simplesmente descartada, em vez de tentar atualizar uma tela que não existe mais.
+
+Como reforço adicional, o botão **"← Voltar"** (`self.btn_voltar`) passou a ser incluído na lista de botões desabilitados por `_definir_ocupado` durante uma operação — reduzindo a chance de o usuário sair da tela bem no meio de um salvamento/remoção:
+
+```python
+def _definir_ocupado(self, ocupado: bool, mensagem: str = ""):
+    self._operacao_em_andamento = ocupado
+    for botao in (self.btn_add, self.btn_remover, self.btn_salvar, self.btn_recarregar, self.btn_voltar):  # 🆕 btn_voltar
+        botao.setEnabled(not ocupado)
+    ...
+```
+
 ### Montagem da UI (`_montar_ui`)
 
 Monta, de cima para baixo:
-1. **Linha de título** (`_criar_linha_titulo`) — botão "Voltar", indicadores de melhor/pior compra, o mini gráfico, e o nome "Empresa › Produto" centralizado. Um `QLabel` vazio à direita (`espacador`) equilibra visualmente o bloco da esquerda, mantendo o título realmente centralizado.
+1. **Linha de título** (`_criar_linha_titulo`) — botão "Voltar" (agora guardado como `self.btn_voltar` 🆕, em vez de variável local, justamente para poder ser desabilitado por `_definir_ocupado`), indicadores de melhor/pior compra, o mini gráfico, e o nome "Empresa › Produto" centralizado. Um `QLabel` vazio à direita (`espacador`) equilibra visualmente o bloco da esquerda, mantendo o título realmente centralizado.
 2. **Linha de filtro por data** (`_criar_linha_filtro`) — dois `QDateEdit` ("De" / "Até") e os botões "Filtrar" / "Limpar filtro".
 3. **A tabela de compras** — 4 colunas (`COLUNAS_ENTRADAS`), com o cabeçalho pintado na cor da empresa. Ela escuta `itemChanged` (`self.tabela.itemChanged.connect(self._on_item_changed)`).
 4. **Label de total do produto**.
 5. **Linha de botões** (`_criar_linha_botoes`) — Adicionar linha / Remover linha / Recarregar do Sheets / Salvar.
 6. **Label de status**, que mostra mensagens de sucesso (verde) ou erro (vermelho) das operações.
-
-### Bloqueio de botões durante operações (`_definir_ocupado`)
-
-```python
-def _definir_ocupado(self, ocupado: bool, mensagem: str = ""):
-    self._operacao_em_andamento = ocupado
-    for botao in (self.btn_add, self.btn_remover, self.btn_salvar, self.btn_recarregar):
-        botao.setEnabled(not ocupado)
-    if mensagem:
-        self.status_label.setStyleSheet("color: #d9a441;")
-        self.status_label.setText(mensagem)
-```
-
-Desabilita os botões relevantes enquanto uma chamada ao Sheets está em andamento (evita que o usuário clique duas vezes em "Salvar" e mande a mesma coisa duas vezes) e mostra uma mensagem amarela de "carregando".
 
 ### Adicionar / popular linhas
 
@@ -382,7 +459,7 @@ Desabilita os botões relevantes enquanto uma chamada ao Sheets está em andamen
 2. Se a linha **não tem ID** (nunca foi salva no Sheets), remove localmente na hora — não há nada pra apagar remotamente.
 3. Se **tem ID**, pede confirmação (`QMessageBox.question`), já que isso vai apagar um dado real da planilha.
 4. Confirmado, dispara um `SheetsWorker(sheets_remover, [id_linha])` e bloqueia a tela até a resposta.
-5. Quando o worker termina, `_on_remocao_concluida` remove a linha da tabela (se deu certo) ou mostra o erro (se falhou).
+5. Quando o worker termina, `_on_remocao_concluida` **primeiro verifica `self._destruida` 🆕** e, se a página ainda estiver viva, remove a linha da tabela (se deu certo) ou mostra o erro (se falhou).
 
 ### Recalcular ao editar (`_on_item_changed` → `_recalcular_linha` → `_atualizar_indicadores`)
 
@@ -408,15 +485,15 @@ Esse é o "motor" reativo da tela:
 3. Se a linha já tiver um ID (via `_id_da_linha`), ela é uma **atualização** → vai para a lista `existentes`. Senão, gera um novo ID (`gerar_id`), adiciona `empresa`/`produto` ao registro (necessário para o Sheets saber onde inserir) e vai para a lista `novas`. Também guarda, em `linhas_por_id_novo`, qual linha da tabela corresponde a cada novo ID — é assim que depois o código sabe onde "gravar de volta" o ID recém-criado.
 4. Se não houver nada pra enviar, apenas avisa e para.
 5. Caso contrário, dispara `SheetsWorker(sheets_salvar, novas, existentes)`.
-6. Quando termina, `_on_salvamento_concluido` grava o ID de cada linha nova de volta no `UserRole` dela (usando o mapa `linhas_por_id_novo`) — assim, se o usuário salvar de novo sem recarregar, essas linhas já são reconhecidas como "existentes" em vez de criar duplicatas.
+6. Quando termina, `_on_salvamento_concluido` **primeiro verifica `self._destruida` 🆕** e, se a página ainda estiver viva, grava o ID de cada linha nova de volta no `UserRole` dela (usando o mapa `linhas_por_id_novo`) — assim, se o usuário salvar de novo sem recarregar, essas linhas já são reconhecidas como "existentes" em vez de criar duplicatas.
 
 ### Recarregar do Sheets (`_recarregar_do_sheets` → `_on_recarregamento_concluido`)
 
-Busca de novo todos os registros da empresa e filtra só os do produto atual (`linha.get("produto") == self.produto`), repopulando a tabela do zero — útil se outra pessoa alterou a planilha por fora do app.
+Busca de novo todos os registros da empresa e filtra só os do produto atual (`linha.get("produto") == self.produto`), repopulando a tabela do zero — útil se outra pessoa alterou a planilha por fora do app. `_on_recarregamento_concluido` também **verifica `self._destruida` 🆕** antes de tocar em qualquer widget.
 
 ---
 
-## 8. Página 2 — Lista de produtos (`ProductListPage`)
+## 9. Página 2 — Lista de produtos (`ProductListPage`)
 
 Mostra todos os produtos de uma empresa, com a data e o valor da última compra de cada um.
 
@@ -432,22 +509,37 @@ self._geracao_carregamento = 0  # usado pelo watchdog de timeout (ver abaixo)
 
 `_produtos_pendentes` existe porque, quando o usuário cria um produto novo pelo botão "Adicionar novo item", esse produto **ainda não existe na planilha** (só passa a existir quando a primeira compra é salva). Enquanto isso, ele fica "pendurado" nessa lista, só para continuar aparecendo na tabela.
 
-### Carregar dados com proteção contra travamento (`recarregar`)
+### 🆕 Carregar com cache primeiro, rede depois (`recarregar`)
 
 ```python
 def recarregar(self):
-    ...
-    self._geracao_carregamento += 1
-    geracao_desta_chamada = self._geracao_carregamento
+    if self._operacao_em_andamento:
+        return
 
+    # 1) Mostra na hora o que já temos em cache local, sem esperar a rede.
+    dados_cache = cache_carregar(self.empresa["nome"])
+    if dados_cache:
+        self._linhas_por_produto = {}
+        for linha in dados_cache:
+            self._linhas_por_produto.setdefault(linha["produto"], []).append(linha)
+        self._produtos_pendentes = [p for p in self._produtos_pendentes if p not in self._linhas_por_produto]
+        self._reconstruir_tabela()
+        self.dica_label.setText("Mostrando dados salvos localmente — atualizando com o Google Sheets...")
+    else:
+        self.dica_label.setText("Carregando produtos do Google Sheets...")
+
+    # 2) Em paralelo, busca a versão atual no Sheets pra confirmar/atualizar.
+    self._definir_ocupado(True)
+    ...
     self._worker = SheetsWorker(sheets_buscar, self.empresa["nome"])
     self._worker.concluido.connect(self._on_carregamento_concluido)
     self._worker.start()
-
-    QTimer.singleShot(45000, lambda: self._verificar_timeout_carregamento(geracao_desta_chamada))
+    ...
 ```
 
-Aqui aparece um detalhe interessante: além do `timeout` já configurado dentro da própria requisição HTTP (40s), existe um **watchdog** adicional de 45s usando `QTimer.singleShot`. Ele existe para cobrir casos raros em que uma falha de rede/DNS trava a chamada sem respeitar o timeout interno do `urllib` — nesse cenário, sem esse watchdog, a tela ficaria presa para sempre em "Carregando...".
+Essa é a principal mudança de performance percebida do app: antes, `recarregar()` sempre mostrava "Carregando..." e ficava esperando a resposta da rede pra desenhar qualquer coisa. Agora, se existir um cache local daquela empresa (ver [Seção 5](#5-cache-local-em-disco-)), a tabela é populada **imediatamente** com esses dados, e só depois a busca real ao Sheets é disparada em segundo plano pra confirmar/atualizar. O usuário passa a ver dados quase instantaneamente ao trocar de empresa, mesmo que a rede ou o Apps Script demorem alguns segundos para responder.
+
+Além disso, existe o `timeout` já configurado dentro da própria requisição HTTP (40s) e um **watchdog** adicional de 45s usando `QTimer.singleShot`. Ele existe para cobrir casos raros em que uma falha de rede/DNS trava a chamada sem respeitar o timeout interno do `urllib` — nesse cenário, sem esse watchdog, a tela ficaria presa para sempre em "Carregando...".
 
 O contador `_geracao_carregamento` resolve um problema clássico de concorrência: se o usuário clicar em "Recarregar" várias vezes seguidas, cada chamada a `recarregar()` incrementa esse contador e guarda o valor daquela chamada especificamente (`geracao_desta_chamada`). Quando o watchdog dispara 45s depois, ele só age se **essa ainda for a geração mais recente** — ou seja, se nenhuma busca mais nova foi iniciada nesse meio-tempo. Isso evita que um watchdog "antigo" interrompa uma busca "nova" que ainda está em andamento.
 
@@ -460,10 +552,13 @@ for linha in resultado:
 
 self._produtos_pendentes = [p for p in self._produtos_pendentes if p not in self._linhas_por_produto]
 
+cache_salvar(self.empresa["nome"], resultado)  # 🆕
 self._reconstruir_tabela()
 ```
 
-Agrupa a lista "achatada" de linhas que veio do Sheets num dicionário `{produto: [linhas]}`, usando `setdefault` para criar a lista na primeira vez que um produto aparece. Em seguida, "limpa" a lista de pendentes: qualquer produto que já apareceu nos dados reais do Sheets deixa de ser "pendente" (já tem pelo menos uma compra salva).
+Agrupa a lista "achatada" de linhas que veio do Sheets num dicionário `{produto: [linhas]}`, usando `setdefault` para criar a lista na primeira vez que um produto aparece. Em seguida, "limpa" a lista de pendentes: qualquer produto que já apareceu nos dados reais do Sheets deixa de ser "pendente" (já tem pelo menos uma compra salva). 🆕 Por fim, o resultado é gravado no cache local, pra próxima abertura dessa empresa já começar instantânea.
+
+🆕 Se a busca **falhar** mas já havia dados de cache exibidos na tela (`self._linhas_por_produto` não vazio), o código mantém esses dados visíveis e só troca a mensagem de dica para avisar que a atualização falhou — em vez de apagar tudo e mostrar um erro sobre uma tela vazia.
 
 ### Reconstruir, ordenar e pesquisar (`_reconstruir_tabela`)
 
@@ -489,7 +584,7 @@ Para cada produto, busca a última compra com `obter_ultima_compra` e mostra sua
 
 ---
 
-## 9. Página 1 — Seleção de empresa (`CompanySelectPage`)
+## 10. Página 1 — Seleção de empresa (`CompanySelectPage`)
 
 A tela mais simples: para cada empresa em `COMPANIES`, cria um "card" vertical com o avatar circular (via `criar_avatar_circular`) e um botão colorido com o nome da empresa, que ao ser clicado chama `escolher_callback(empresa)`.
 
@@ -497,7 +592,7 @@ Se `GOOGLE_SHEETS_WEBHOOK_URL` estiver vazia, mostra um aviso vermelho no topo, 
 
 ---
 
-## 10. Janela principal e navegação (`MainWindow`)
+## 11. Janela principal e navegação (`MainWindow`)
 
 ```python
 self.stack = QStackedWidget()
@@ -525,13 +620,14 @@ else:
 self.stack.setCurrentWidget(self._paginas_produtos[nome_empresa])
 ```
 
-A página de lista de produtos **é reaproveitada** por empresa: na primeira vez que o usuário abre "Narua", uma `ProductListPage` é criada e guardada no dicionário `_paginas_produtos`. Da segunda vez em diante, em vez de criar tudo de novo, o código só chama `.recarregar()` nela — que busca os dados atualizados sem reconstruir a interface do zero.
+A página de lista de produtos **é reaproveitada** por empresa: na primeira vez que o usuário abre "Narua", uma `ProductListPage` é criada e guardada no dicionário `_paginas_produtos`. Da segunda vez em diante, em vez de criar tudo de novo, o código só chama `.recarregar()` nela — que agora (🆕) primeiro mostra o cache local e depois busca os dados atualizados, sem reconstruir a interface do zero.
 
-### `abrir_produto(empresa, produto, linhas)`
+### 🆕 `abrir_produto(empresa, produto, linhas)`
 
 ```python
 pagina = ProductEntriesPage(empresa, produto, linhas, voltar_callback=...)
 if self._pagina_entradas_atual is not None:
+    self._pagina_entradas_atual.marcar_destruida()   # 🆕
     self.stack.removeWidget(self._pagina_entradas_atual)
     self._pagina_entradas_atual.deleteLater()
 
@@ -540,7 +636,9 @@ self.stack.addWidget(pagina)
 self.stack.setCurrentWidget(pagina)
 ```
 
-Diferente da lista de produtos, a página de **compras de um produto não é reaproveitada** — toda vez que o usuário abre um produto, uma `ProductEntriesPage` nova é criada. Isso é intencional: como os dados vêm sempre "frescos" da lista de produtos (que acabou de recarregar do Sheets), é mais simples e seguro recriar a tela do que tentar atualizar uma existente. A página anterior é removida da pilha (`removeWidget`) e agendada para ser destruída (`deleteLater`, o jeito seguro do Qt de liberar memória sem correr risco de travar algo que ainda está em uso).
+Diferente da lista de produtos, a página de **compras de um produto não é reaproveitada** — toda vez que o usuário abre um produto, uma `ProductEntriesPage` nova é criada. Isso é intencional: como os dados vêm sempre "frescos" da lista de produtos (que acabou de recarregar do Sheets), é mais simples e seguro recriar a tela do que tentar atualizar uma existente.
+
+A página anterior é removida da pilha (`removeWidget`) e agendada para ser destruída (`deleteLater`, o jeito seguro do Qt de liberar memória sem correr risco de travar algo que ainda está em uso). 🆕 **Antes disso**, porém, `marcar_destruida()` é chamado nela — é essa linha que avisa a página antiga (e, por extensão, qualquer `SheetsWorker` seu ainda em voo) que ela está de saída, evitando o crash descrito na [Seção 8](#8-página-3--compras-de-um-produto-producteentriespage).
 
 ### Voltar (`voltar_para_lista_produtos` / `voltar_para_selecao`)
 
@@ -548,7 +646,7 @@ Ao voltar da tela de compras para a lista de produtos, o código também chama `
 
 ---
 
-## 11. Fluxo completo de uma tela até a outra
+## 12. Fluxo completo de uma tela até a outra
 
 Um resumo visual de tudo o que foi explicado, seguindo o caminho de "abrir a empresa Narua, ver o produto X e salvar uma nova compra":
 
@@ -562,15 +660,18 @@ Um resumo visual de tudo o que foi explicado, seguindo o caminho de "abrir a emp
         │
         ▼
 3. ProductListPage.recarregar()
+   🆕 mostra o cache local (se existir) na hora
    dispara SheetsWorker(sheets_buscar, "Narua")  ──► GET no Apps Script
+   (🆕 o Apps Script tenta responder a partir do cache de 60s antes de reler a planilha)
         │
         ▼ (sinal "concluido")
 4. ProductListPage._on_carregamento_concluido()
-   agrupa linhas por produto, reconstrói a tabela
+   agrupa linhas por produto, 🆕 salva no cache local, reconstrói a tabela
         │
         │ usuário clica em "Abrir lista →" no produto X
         ▼
 5. MainWindow.abrir_produto(empresa, "Produto X", linhas)
+   🆕 marca a ProductEntriesPage anterior (se houver) como destruída, antes de removê-la
    cria uma nova ProductEntriesPage
         │
         │ usuário edita quantidade/preço, clica em "Salvar"
@@ -578,15 +679,17 @@ Um resumo visual de tudo o que foi explicado, seguindo o caminho de "abrir a emp
 6. ProductEntriesPage._salvar()
    monta listas "novas"/"existentes", dispara
    SheetsWorker(sheets_salvar, novas, existentes)  ──► POST no Apps Script
+   (🆕 o Apps Script grava as linhas novas em lote e invalida o cache de leitura)
         │
         ▼ (sinal "concluido")
 7. ProductEntriesPage._on_salvamento_concluido()
-   grava os novos IDs nas linhas, mostra "✓ Salvo com sucesso"
+   🆕 se a página já foi destruída nesse meio-tempo, ignora o resultado e para aqui
+   senão: grava os novos IDs nas linhas, mostra "✓ Salvo com sucesso"
 ```
 
 ---
 
-## 12. Ponto de entrada (`main`)
+## 13. Ponto de entrada (`main`)
 
 ```python
 def main():
@@ -608,6 +711,135 @@ if __name__ == "__main__":
 
 ---
 
+## 14. Backend Apps Script (`apps_script_backend.gs`) 🆕
+
+Esse arquivo roda **dentro do Google**, ligado à planilha (Extensões → Apps Script), e é o único ponto de contato entre o Python e os dados. Ele expõe duas "rotas" HTTP: `doGet` (ler) e `doPost` (salvar/remover).
+
+### Estrutura da planilha
+
+```
+ID | Empresa | Produto | Data | Quantidade | Preço Unitário | Preço Total
+```
+
+🆕 O array `CABECALHO` foi corrigido para refletir essas 7 colunas de verdade — na versão anterior ele só listava 5 nomes, o que não batia com o que era realmente gravado.
+
+### `getPlanilha()` / `lerTodasLinhasDaPlanilha()`
+
+`getPlanilha()` pega a aba ativa da planilha, criando o cabeçalho se ela estiver totalmente vazia. `lerTodasLinhasDaPlanilha()` lê a planilha inteira **de uma vez** (`getDataRange().getValues()`) e converte cada linha num objeto JS `{id, empresa, produto, data, quantidade, preco_unitario, preco_total}`, pulando linhas sem ID (vazias).
+
+### 🆕 Cache de leitura (`cacheSalvarLista` / `cacheCarregarLista` / `invalidarCache`)
+
+Esse é o maior ganho de velocidade do backend. `CacheService.getScriptCache()` guarda dados temporários no lado do Google, mas cada chave tem um limite de **100KB** — pouco para uma "lista imensa". Por isso, a lista inteira (já em JSON) é dividida em pedaços de até 90.000 caracteres e salva em múltiplas chaves (`linhas_planilha_0`, `linhas_planilha_1`, ...), junto com uma chave `linhas_planilha_meta` guardando quantos pedaços existem.
+
+```javascript
+function cacheSalvarLista(linhas) {
+  try {
+    var cache = CacheService.getScriptCache();
+    var texto = JSON.stringify(linhas);
+    var numChunks = Math.max(1, Math.ceil(texto.length / CACHE_TAMANHO_CHUNK));
+    var valores = {};
+    for (var i = 0; i < numChunks; i++) {
+      valores[CACHE_CHAVE_BASE + "_" + i] = texto.substr(i * CACHE_TAMANHO_CHUNK, CACHE_TAMANHO_CHUNK);
+    }
+    valores[CACHE_CHAVE_BASE + "_meta"] = String(numChunks);
+    cache.putAll(valores, CACHE_SEGUNDOS);
+  } catch (erro) {
+    // se nem isso couber no cache, segue sem cache — nunca quebra a requisição
+  }
+}
+```
+
+`cacheCarregarLista()` faz o caminho inverso: lê a chave `_meta` pra saber quantos pedaços existem, busca todos de uma vez (`cache.getAll`) e remonta o JSON. Se qualquer pedaço estiver faltando (expirou, por exemplo), descarta tudo e devolve `null`, forçando uma releitura da planilha.
+
+`invalidarCache()` apaga todas essas chaves. Ela é chamada em **toda** operação de escrita (`salvar` e `remover`), garantindo que ninguém veja dados desatualizados depois de uma alteração.
+
+O tempo de vida do cache é `CACHE_SEGUNDOS = 60` — ajustável no topo do arquivo. Quanto maior, menos vezes a planilha é relida, mas maior a chance de alguém ver dados com até esse tempo de atraso caso a planilha seja editada por fora do app (direto no Google Sheets, por exemplo).
+
+### `doGet(e)`
+
+```javascript
+function doGet(e) {
+  var filtroEmpresa = (e && e.parameter && e.parameter.empresa) || null;
+  var linhas = cacheCarregarLista();
+  if (!linhas) {
+    linhas = lerTodasLinhasDaPlanilha();
+    cacheSalvarLista(linhas);
+  }
+  if (filtroEmpresa) {
+    linhas = linhas.filter(function (l) { return l.empresa === filtroEmpresa; });
+  }
+  return responder({ ok: true, linhas: linhas });
+}
+```
+
+🆕 Agora tenta o cache primeiro; só lê a planilha de verdade em caso de cache "frio" (primeira chamada, ou depois de expirar/ser invalidado). O filtro por empresa é aplicado **depois** de obter a lista completa (do cache ou da planilha) — assim, uma única lista em cache serve pra todas as empresas, e cada empresa não precisa de um cache separado.
+
+### 🆕 `construirIndiceIds(planilha)` — elimina o gargalo de escrita
+
+```javascript
+function construirIndiceIds(planilha) {
+  var indice = {};
+  var ultimaLinha = planilha.getLastRow();
+  if (ultimaLinha < 2) return indice;
+  var ids = planilha.getRange(2, 1, ultimaLinha - 1, 1).getValues();
+  for (var i = 0; i < ids.length; i++) {
+    if (ids[i][0] !== "") indice[String(ids[i][0])] = i + 2;
+  }
+  return indice;
+}
+```
+
+Antes, cada atualização ou remoção fazia sua **própria** varredura da coluna A inteira pra achar a linha correspondente àquele ID — se você salvasse 10 linhas existentes numa planilha de 5.000 linhas, isso significava 10 leituras de 5.000 células cada. Agora, essa varredura acontece **uma única vez por requisição**, construindo um mapa `{id: número_da_linha}` que é reaproveitado por todas as atualizações/remoções daquela chamada. Isso muda o custo de O(n × m) para O(n + m), o que faz muita diferença numa "lista imensa".
+
+### `doPost(e)` / `salvarRegistros` / `removerRegistros`
+
+```javascript
+function salvarRegistros(planilha, novas, existentes) {
+  if (novas.length > 0) {
+    var linhaInicial = planilha.getLastRow() + 1;
+    var dados = novas.map(function (l) {
+      return [l.id, l.empresa, l.produto, l.data, l.quantidade, l.preco_unitario, l.preco_total];
+    });
+    planilha.getRange(linhaInicial, 1, dados.length, NUM_COLUNAS).setValues(dados);
+  }
+
+  if (existentes.length > 0) {
+    var indice = construirIndiceIds(planilha);
+    existentes.forEach(function (l) {
+      var linhaIndex = indice[String(l.id)];
+      if (linhaIndex) {
+        planilha.getRange(linhaIndex, 4, 1, 4).setValues([[l.data, l.quantidade, l.preco_unitario, l.preco_total]]);
+      }
+    });
+  }
+}
+```
+
+🆕 As linhas **novas** deixaram de ser gravadas com um `appendRow()` por linha (cada um sendo uma chamada separada à API do Sheets) e passaram a ser gravadas todas de uma vez, com um único `setValues()` numa faixa de células contígua começando logo após a última linha usada. As linhas **existentes** usam o índice construído uma única vez, como explicado acima.
+
+```javascript
+function removerRegistros(planilha, ids) {
+  if (!ids.length) return 0;
+  var indice = construirIndiceIds(planilha);
+  var linhasParaRemover = [];
+  ids.forEach(function (id) {
+    var linhaIndex = indice[String(id)];
+    if (linhaIndex) linhasParaRemover.push(linhaIndex);
+  });
+  linhasParaRemover.sort(function (a, b) { return b - a; });
+  linhasParaRemover.forEach(function (linhaIndex) {
+    planilha.deleteRow(linhaIndex);
+  });
+  return linhasParaRemover.length;
+}
+```
+
+Mesma lógica: o índice é construído uma vez, todas as linhas a remover são localizadas nele, e só então são apagadas — de baixo para cima, pra não bagunçar os índices das linhas seguintes ao deletar.
+
+Por fim, `doPost` chama `invalidarCache()` depois de qualquer `salvar` ou `remover` bem-sucedido, garantindo que a próxima leitura (`doGet`) já reflita os dados novos, em vez de servir uma versão em cache desatualizada.
+
+---
+
 ## Glossário rápido
 
 | Termo | Significado no contexto do app |
@@ -617,3 +849,7 @@ if __name__ == "__main__":
 | **`pyqtSignal`** | "Evento" do Qt: uma forma segura de uma thread avisar a interface que algo aconteceu |
 | **`UserRole`** | Um espaço "escondido" dentro de um item de tabela do Qt, usado aqui para guardar o ID da planilha sem exibi-lo na tela |
 | **Linha "pendente"** | Produto criado na interface que ainda não tem nenhuma compra salva no Sheets |
+| 🆕 **`_destruida`** | Flag na `ProductEntriesPage` que marca quando a tela foi fechada, pra callbacks de rede atrasados saberem que devem se ignorar em vez de mexer em widgets já apagados |
+| 🆕 **Cache local (Python)** | Arquivo `.json` por empresa, em `cache/`, usado para popular a tela instantaneamente antes da resposta real do Sheets chegar |
+| 🆕 **`CacheService` (Apps Script)** | Cache temporário do lado do Google, usado para não reler a planilha inteira a cada `GET`, respeitando o limite de 100KB por chave via divisão em pedaços |
+| 🆕 **Índice de IDs** | Mapa `{id: linha}` construído uma única vez por requisição de escrita, evitando releituras repetidas da coluna de IDs |
