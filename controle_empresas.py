@@ -205,9 +205,13 @@ def sheets_buscar(empresa: str = None) -> list:
     return linhas
 
 
-def sheets_salvar(novas: list, existentes: list) -> None:
+def sheets_salvar(novas: list, existentes: list) -> list:
+    """Devolve a lista de IDs que o Apps Script não encontrou na planilha
+    (linha apagada por fora, por exemplo) — essas edições não foram salvas,
+    mesmo a requisição como um todo tendo dado certo."""
     payload = json.dumps({"acao": "salvar", "novas": novas, "existentes": existentes}).encode("utf-8")
-    _requisitar(GOOGLE_SHEETS_WEBHOOK_URL, dados=payload, metodo="POST")
+    corpo = _requisitar(GOOGLE_SHEETS_WEBHOOK_URL, dados=payload, metodo="POST")
+    return corpo.get("idsNaoEncontrados", [])
 
 
 def sheets_remover(ids: list) -> None:
@@ -489,8 +493,10 @@ class ProductEntriesPage(QWidget):
         self.voltar_callback = voltar_callback
         self._carregando = False
         self._operacao_em_andamento = False
-        self._worker = None
+        self._workers_ativos = []  # referências fortes aos SheetsWorker em voo (ver _disparar_worker)
+        self._remocoes_em_andamento = 0  # quantas remoções de linha ainda não confirmaram (ver _salvar/_recarregar)
         self._alteracoes_nao_salvas = False  # edição pendente de salvar (ver _tentar_voltar)
+        self._itens_editados = set()  # ids de objeto das linhas tocadas desde o último salvamento (ver _salvar)
         # True quando a MainWindow já destruiu esta página (ex: abriu outro
         # produto); callbacks de rede atrasados checam isso antes de mexer
         # em widgets, evitando o RuntimeError de objeto C++ já deletado.
@@ -501,6 +507,24 @@ class ProductEntriesPage(QWidget):
 
     def marcar_destruida(self):
         self._destruida = True
+
+    def _disparar_worker(self, funcao, *args, ao_concluir):
+        """Roda uma função de rede em segundo plano. Mantém uma referência
+        forte ao worker em self._workers_ativos até ele terminar — sem isso,
+        disparar uma segunda operação em paralelo (ex: remover duas linhas
+        rapidamente) sobrescreveria a única referência Python à primeira
+        QThread ainda rodando, arriscando derrubar o app."""
+        worker = SheetsWorker(funcao, *args)
+        self._workers_ativos.append(worker)
+
+        def _finalizar(ok, resultado):
+            if worker in self._workers_ativos:
+                self._workers_ativos.remove(worker)
+            ao_concluir(ok, resultado)
+
+        worker.concluido.connect(_finalizar)
+        worker.start()
+        return worker
 
     def _montar_ui(self):
         layout = QVBoxLayout(self)
@@ -698,14 +722,37 @@ class ProductEntriesPage(QWidget):
 
         self._atualizar_indicadores()
         self._alteracoes_nao_salvas = False  # dados recém-carregados: nada para salvar ainda
+        self._itens_editados = set()
 
     def _id_da_linha(self, row: int):
         item = self.tabela.item(row, COL_DATA)
         return item.data(Qt.ItemDataRole.UserRole) if item else None
 
+    def _snapshot_linha(self, row: int) -> dict:
+        qtd_txt = self._texto_celula(row, COL_QTD)
+        preco_txt = self._texto_celula(row, COL_PRECO_UNIT)
+        item_data = self.tabela.item(row, COL_DATA)
+        return {
+            "id": self._id_da_linha(row),
+            "data": self._texto_celula(row, COL_DATA),
+            "quantidade": qtd_txt,
+            "preco_unitario": preco_txt,
+            "preco_total": parse_numero(qtd_txt) * parse_numero(preco_txt),
+            "_editada": item_data is not None and id(item_data) in self._itens_editados,
+        }
+
+    def _esquecer_edicao(self, row: int):
+        """Tira a marca de 'editada' da linha antes dela ser removida da
+        tabela. Sem isso, o endereço de memória do item removido poderia ser
+        reciclado depois por um item de outra linha nunca tocada, marcando-a
+        como suja (e reenviando-a ao Sheets) por engano."""
+        item_data = self.tabela.item(row, COL_DATA)
+        if item_data is not None:
+            self._itens_editados.discard(id(item_data))
+
     def _remover_linha(self):
         if self._operacao_em_andamento:
-            return
+            return  # evita corromper os índices de linha de um Salvar/Recarregar em andamento
         row = self.tabela.currentRow()
         if row < 0:
             QMessageBox.information(self, "Remover linha", "Selecione uma linha para remover.")
@@ -713,6 +760,7 @@ class ProductEntriesPage(QWidget):
 
         id_linha = self._id_da_linha(row)
         if not id_linha:
+            self._esquecer_edicao(row)
             self.tabela.removeRow(row)
             self._atualizar_indicadores()
             return
@@ -725,21 +773,34 @@ class ProductEntriesPage(QWidget):
         if resposta != QMessageBox.StandardButton.Yes:
             return
 
-        self._definir_ocupado(True, "Removendo do Google Sheets...")
-        self._worker = SheetsWorker(sheets_remover, [id_linha])
-        self._worker.concluido.connect(lambda ok, msg: self._on_remocao_concluida(ok, msg, row))
-        self._worker.start()
+        # remoção otimista: some da tela na hora, sem esperar a rede — se o
+        # Sheets recusar, a linha volta e um erro é mostrado
+        dados_removidos = self._snapshot_linha(row)
+        self._esquecer_edicao(row)
+        self.tabela.removeRow(row)
+        self._atualizar_indicadores()
 
-    def _on_remocao_concluida(self, sucesso: bool, mensagem, row: int):
+        self._remocoes_em_andamento += 1
+        self._disparar_worker(
+            sheets_remover, [id_linha],
+            ao_concluir=lambda ok, msg: self._on_remocao_concluida(ok, msg, dados_removidos),
+        )
+
+    def _on_remocao_concluida(self, sucesso: bool, mensagem, dados_removidos: dict):
+        self._remocoes_em_andamento -= 1
         if self._destruida:
             return  # a página já foi fechada/trocada enquanto a rede respondia
-        self._definir_ocupado(False)
         if sucesso:
-            self.tabela.removeRow(row)
-            self._atualizar_indicadores()
             self.status_label.setStyleSheet("color: #2e7d32;")
             self.status_label.setText("Linha removida do Google Sheets.")
         else:
+            row = self._adicionar_linha(dados_removidos)  # desfaz a remoção otimista
+            if dados_removidos.get("_editada"):
+                item_data = self.tabela.item(row, COL_DATA)
+                if item_data is not None:
+                    self._itens_editados.add(id(item_data))
+                    self._alteracoes_nao_salvas = True
+            self._atualizar_indicadores()
             self.status_label.setStyleSheet("color: #c0392b;")
             self.status_label.setText(f"Falha ao remover: {mensagem}")
             QMessageBox.critical(self, "Erro ao remover", str(mensagem))
@@ -748,6 +809,9 @@ class ProductEntriesPage(QWidget):
         if self._carregando:
             return
         self._alteracoes_nao_salvas = True
+        item_data = self.tabela.item(item.row(), COL_DATA)
+        if item_data is not None:
+            self._itens_editados.add(id(item_data))  # marca a linha como suja, pro _salvar reenviar só ela
         if item.column() in (COL_QTD, COL_PRECO_UNIT):
             self._recalcular_linha(item.row())
         self._atualizar_indicadores()
@@ -830,16 +894,21 @@ class ProductEntriesPage(QWidget):
         self.status_label.setText("Filtro removido.")
 
     def _salvar(self):
-        if self._operacao_em_andamento:
+        if self._operacao_em_andamento or self._remocoes_em_andamento > 0:
             return
 
-        novas, existentes, linhas_por_id_novo = [], [], {}
+        novas, existentes, linhas_por_id_novo, itens_enviados = [], [], {}, set()
 
         for row in range(self.tabela.rowCount()):
             qtd = parse_numero(self._texto_celula(row, COL_QTD))
             preco = parse_numero(self._texto_celula(row, COL_PRECO_UNIT))
             if qtd <= 0 or preco <= 0:
                 continue  # ignora linhas em branco/incompletas
+
+            id_linha = self._id_da_linha(row)
+            item_data = self.tabela.item(row, COL_DATA)
+            if id_linha and id(item_data) not in self._itens_editados:
+                continue  # já está salva e não foi tocada — não reenvia à toa
 
             registro = {
                 "data": self._texto_celula(row, COL_DATA),
@@ -848,7 +917,6 @@ class ProductEntriesPage(QWidget):
                 "preco_total": qtd * preco,
             }
 
-            id_linha = self._id_da_linha(row)
             if id_linha:
                 registro["id"] = id_linha
                 existentes.append(registro)
@@ -860,42 +928,74 @@ class ProductEntriesPage(QWidget):
                 novas.append(registro)
                 linhas_por_id_novo[novo_id] = row
 
+            itens_enviados.add(id(item_data))
+
         if not novas and not existentes:
             self.status_label.setStyleSheet("color: #2e7d32;")
-            self.status_label.setText("Nada para salvar (preencha quantidade e preço unitário).")
+            self.status_label.setText("Nada para salvar (preencha quantidade e preço unitário, ou nada mudou).")
             return
 
         self._definir_ocupado(True, "Salvando no Google Sheets...")
-        self._worker = SheetsWorker(sheets_salvar, novas, existentes)
-        self._worker.concluido.connect(lambda ok, msg: self._on_salvamento_concluido(ok, msg, linhas_por_id_novo))
-        self._worker.start()
+        self._disparar_worker(
+            sheets_salvar, novas, existentes,
+            ao_concluir=lambda ok, resultado: self._on_salvamento_concluido(
+                ok, resultado, linhas_por_id_novo, itens_enviados
+            ),
+        )
 
-    def _on_salvamento_concluido(self, sucesso: bool, mensagem, linhas_por_id_novo: dict):
+    def _on_salvamento_concluido(self, sucesso: bool, resultado, linhas_por_id_novo: dict, itens_enviados: set):
         if self._destruida:
             return  # a página já foi fechada/trocada enquanto a rede respondia
         self._definir_ocupado(False)
         if sucesso:
+            ids_nao_encontrados = set(resultado or [])
             self._carregando = True
             for novo_id, row in linhas_por_id_novo.items():
                 item = self.tabela.item(row, COL_DATA)
                 if item:
                     item.setData(Qt.ItemDataRole.UserRole, novo_id)
             self._carregando = False
-            self._alteracoes_nao_salvas = False
-            self.status_label.setStyleSheet("color: #2e7d32;")
-            self.status_label.setText("✓ Salvo no Google Sheets com sucesso.")
+
+            if ids_nao_encontrados:
+                # o Apps Script avisou que algumas linhas "existentes" não
+                # foram achadas na planilha (apagada por fora, por exemplo)
+                # — mantém só essas específicas como pendentes, em vez de
+                # assumir que tudo foi salvo
+                itens_com_problema = set()
+                for row in range(self.tabela.rowCount()):
+                    if self._id_da_linha(row) in ids_nao_encontrados:
+                        item_data = self.tabela.item(row, COL_DATA)
+                        if item_data is not None:
+                            itens_com_problema.add(id(item_data))
+                self._itens_editados -= (itens_enviados - itens_com_problema)
+                self._alteracoes_nao_salvas = bool(self._itens_editados)
+                self.status_label.setStyleSheet("color: #c0392b;")
+                self.status_label.setText(
+                    f"⚠ {len(ids_nao_encontrados)} linha(s) não encontrada(s) no Sheets — continuam pendentes."
+                )
+                QMessageBox.warning(
+                    self, "Salvamento parcial",
+                    f"{len(ids_nao_encontrados)} linha(s) não foram encontradas no Google Sheets "
+                    "(podem ter sido apagadas por fora) e continuam pendentes. Recarregue pra conferir."
+                )
+            else:
+                # remove só o que foi enviado agora — uma edição feita em
+                # outra linha enquanto este salvamento estava em andamento
+                # continua marcada como pendente, em vez de ser descartada
+                self._itens_editados -= itens_enviados
+                self._alteracoes_nao_salvas = bool(self._itens_editados)
+                self.status_label.setStyleSheet("color: #2e7d32;")
+                self.status_label.setText("✓ Salvo no Google Sheets com sucesso.")
         else:
             self.status_label.setStyleSheet("color: #c0392b;")
-            self.status_label.setText(f"Falha ao salvar: {mensagem}")
-            QMessageBox.critical(self, "Erro ao salvar no Google Sheets", str(mensagem))
+            self.status_label.setText(f"Falha ao salvar: {resultado}")
+            QMessageBox.critical(self, "Erro ao salvar no Google Sheets", str(resultado))
 
     def _recarregar_do_sheets(self):
-        if self._operacao_em_andamento:
+        if self._operacao_em_andamento or self._remocoes_em_andamento > 0:
             return
         self._definir_ocupado(True, "Recarregando do Google Sheets...")
-        self._worker = SheetsWorker(sheets_buscar, self.empresa["nome"])
-        self._worker.concluido.connect(self._on_recarregamento_concluido)
-        self._worker.start()
+        self._disparar_worker(sheets_buscar, self.empresa["nome"], ao_concluir=self._on_recarregamento_concluido)
 
     def _on_recarregamento_concluido(self, sucesso: bool, resultado):
         if self._destruida:
@@ -929,7 +1029,8 @@ class ProductListPage(QWidget):
         self._linhas_por_produto = {}   # produto -> [linhas da planilha]
         self._produtos_pendentes = []   # produtos criados nesta sessão, sem nenhuma compra salva
         self._operacao_em_andamento = False
-        self._worker = None
+        self._workers_ativos = []  # referências fortes aos SheetsWorker em voo (ver _disparar_worker)
+        self._remocoes_em_andamento = 0  # quantas remoções de produto ainda não confirmaram (ver recarregar)
         self._ordem_crescente = True    # True = A-Z, False = Z-A
         self._texto_pesquisa = ""
         self._geracao_carregamento = 0
@@ -1037,8 +1138,26 @@ class ProductListPage(QWidget):
         for botao in (self.btn_add, self.btn_remover, self.btn_recarregar):
             botao.setEnabled(not ocupado)
 
+    def _disparar_worker(self, funcao, *args, ao_concluir):
+        """Roda uma função de rede em segundo plano. Mantém uma referência
+        forte ao worker em self._workers_ativos até ele terminar — sem isso,
+        disparar uma segunda operação em paralelo sobrescreveria a única
+        referência Python à primeira QThread ainda rodando, arriscando
+        derrubar o app."""
+        worker = SheetsWorker(funcao, *args)
+        self._workers_ativos.append(worker)
+
+        def _finalizar(ok, resultado):
+            if worker in self._workers_ativos:
+                self._workers_ativos.remove(worker)
+            ao_concluir(ok, resultado)
+
+        worker.concluido.connect(_finalizar)
+        worker.start()
+        return worker
+
     def recarregar(self):
-        if self._operacao_em_andamento:
+        if self._operacao_em_andamento or self._remocoes_em_andamento > 0:
             return
 
         # mostra o cache local na hora, sem esperar a rede
@@ -1061,9 +1180,7 @@ class ProductListPage(QWidget):
         self._geracao_carregamento = getattr(self, "_geracao_carregamento", 0) + 1
         geracao_desta_chamada = self._geracao_carregamento
 
-        self._worker = SheetsWorker(sheets_buscar, self.empresa["nome"])
-        self._worker.concluido.connect(self._on_carregamento_concluido)
-        self._worker.start()
+        self._disparar_worker(sheets_buscar, self.empresa["nome"], ao_concluir=self._on_carregamento_concluido)
 
         # watchdog: sai do "Carregando..." se não vier resposta em 45s
         QTimer.singleShot(45000, lambda: self._verificar_timeout_carregamento(geracao_desta_chamada))
@@ -1216,21 +1333,25 @@ class ProductListPage(QWidget):
             self._reconstruir_tabela()
             return
 
-        self._definir_ocupado(True)
-        self.status_label.setStyleSheet("color: #d9a441;")
-        self.status_label.setText("Removendo do Google Sheets...")
-        self._worker = SheetsWorker(sheets_remover, ids)
-        self._worker.concluido.connect(lambda ok, msg: self._on_remocao_produto_concluida(ok, msg, nome_produto))
-        self._worker.start()
+        # remoção otimista: some da lista na hora, sem esperar a rede — se o
+        # Sheets recusar, o produto volta e um erro é mostrado
+        linhas_removidas = self._linhas_por_produto.pop(nome_produto, [])
+        self._reconstruir_tabela()
 
-    def _on_remocao_produto_concluida(self, sucesso: bool, mensagem, nome_produto: str):
-        self._definir_ocupado(False)
+        self._remocoes_em_andamento += 1
+        self._disparar_worker(
+            sheets_remover, ids,
+            ao_concluir=lambda ok, msg: self._on_remocao_produto_concluida(ok, msg, nome_produto, linhas_removidas),
+        )
+
+    def _on_remocao_produto_concluida(self, sucesso: bool, mensagem, nome_produto: str, linhas_removidas: list):
+        self._remocoes_em_andamento -= 1
         if sucesso:
-            self._linhas_por_produto.pop(nome_produto, None)
-            self._reconstruir_tabela()
             self.status_label.setStyleSheet("color: #2e7d32;")
             self.status_label.setText(f"'{nome_produto}' removido do Google Sheets.")
         else:
+            self._linhas_por_produto[nome_produto] = linhas_removidas  # desfaz a remoção otimista
+            self._reconstruir_tabela()
             self.status_label.setStyleSheet("color: #c0392b;")
             self.status_label.setText(f"Falha ao remover: {mensagem}")
             QMessageBox.critical(self, "Erro ao remover do Google Sheets", str(mensagem))

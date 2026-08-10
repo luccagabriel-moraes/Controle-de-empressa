@@ -11,6 +11,8 @@
 > **Changelog de usabilidade (esta revisão):** navegação por Enter na tabela de compras (Data → Quantidade → Preço Unitário); produto novo nasce com 1 linha em branco (era 3) e já abre automaticamente ao ser criado; aviso de confirmação ao clicar em "← Voltar" havendo alterações não salvas; e nomes/títulos muito longos agora truncam com reticências (+ tooltip) em vez de desalinhar o layout. Marcado nas seções com 🆕².
 >
 > **Changelog de correção (pós-revisão):** a primeira versão da navegação por Enter e do rótulo elidível tinha dois bugs — o hint do Qt usado para detectar o Enter estava errado (e seu nome no PyQt6 varia por versão do binding), e o rótulo elidível calculava a largura de corte antes de estar no layout de verdade, então nunca truncava nada. Os dois foram corrigidos e confirmados com testes isolados. Marcado nas seções com 🆕³.
+>
+> **Changelog de auditoria (revisão de bugs):** uma revisão dedicada (11 problemas confirmados) encontrou e corrigiu: (1) o backend gravava/lia sempre na aba "ativa" da planilha em vez de uma aba fixa; (2) datas podiam voltar com 1 dia de diferença dependendo do fuso horário da planilha; (3) um ID todo numérico podia perder um zero à esquerda; (4) o Apps Script descartava edições de linhas não encontradas sem avisar (respondia "ok" mesmo assim); (5) a exclusão instantânea de linha/produto, ao remover uma trava de segurança antiga, podia derrubar o app se duas ações de rede fossem disparadas em sequência rápida; (6) o backend não tinha nenhum bloqueio contra duas requisições simultâneas; (7) desfazer uma remoção que falhou "esquecia" que a linha restaurada tinha uma edição pendente; (8) o mesmo desfazer também zerava o Total mostrado; (9) o rastreamento de "linha editada" podia, em teoria, confundir uma linha nunca tocada com uma editada. Tudo detalhado nas seções marcadas com 🆕⁴.
 
 ---
 
@@ -244,12 +246,15 @@ Faz um `GET` na planilha. Se um nome de empresa for passado, ele é adicionado c
 ### `sheets_salvar(novas, existentes)`
 
 ```python
-def sheets_salvar(novas: list, existentes: list) -> None:
+def sheets_salvar(novas: list, existentes: list) -> list:
     payload = json.dumps({"acao": "salvar", "novas": novas, "existentes": existentes}).encode("utf-8")
-    _requisitar(GOOGLE_SHEETS_WEBHOOK_URL, dados=payload, metodo="POST")
+    corpo = _requisitar(GOOGLE_SHEETS_WEBHOOK_URL, dados=payload, metodo="POST")
+    return corpo.get("idsNaoEncontrados", [])
 ```
 
 Envia um `POST` com duas listas: `novas` (linhas que ainda não existem na planilha — vão virar gravação em lote) e `existentes` (linhas que já têm um ID e vão ser atualizadas). O Apps Script decide o que fazer com cada lista. 🆕 Do lado do Apps Script, as linhas novas agora são gravadas todas de uma vez (um único `setValues` em bloco) em vez de uma chamada por linha — ver Seção 14.
+
+🆕⁴ **Devolve quais IDs "existentes" não foram encontrados na planilha.** Antes, se uma linha fosse apagada por fora do app (por outra sessão, por exemplo) entre o usuário editá-la e clicar em Salvar, o Apps Script simplesmente descartava aquela edição e respondia "ok" do mesmo jeito — o Python achava que tinha salvo tudo. Agora o backend devolve `idsNaoEncontrados` (ver [Seção 14](#14-backend-apps-script-apps_script_backendgs-)), e `sheets_salvar` repassa essa lista pra quem chamou (`ProductEntriesPage._on_salvamento_concluido`, ver [Seção 8](#8-página-3--compras-de-um-produto-producteentriespage)), que decide o que fazer com cada linha problemática em vez de assumir que está tudo salvo.
 
 ### `sheets_remover(ids)`
 
@@ -466,12 +471,37 @@ self.cor = empresa["cor"]
 self.voltar_callback = voltar_callback
 self._carregando = False           # evita reagir a mudanças feitas pelo próprio código
 self._operacao_em_andamento = False  # bloqueia botões durante chamadas de rede
-self._worker = None
+self._workers_ativos = []          # 🆕⁴ ver "_disparar_worker", abaixo
+self._remocoes_em_andamento = 0    # 🆕⁴ ver "_disparar_worker", abaixo
 self._alteracoes_nao_salvas = False  # 🆕² ver "Sair sem salvar", abaixo
+self._itens_editados = set()       # ver "Salvar", abaixo
 self._destruida = False            # 🆕 ver abaixo
 ```
 
 O flag `_carregando` é importante: sempre que o código preenche a tabela programaticamente (ao abrir a tela, ao recarregar, etc.), ele é ligado antes e desligado depois. Isso evita que o evento `itemChanged` (disparado toda vez que uma célula muda, inclusive por código) recalcule totais e indicadores durante esse preenchimento — o recálculo só deve acontecer quando é o **usuário** editando.
+
+### 🆕⁴ `_disparar_worker(funcao, *args, ao_concluir)` — evita perder a referência a uma QThread ainda rodando
+
+```python
+def _disparar_worker(self, funcao, *args, ao_concluir):
+    worker = SheetsWorker(funcao, *args)
+    self._workers_ativos.append(worker)
+
+    def _finalizar(ok, resultado):
+        if worker in self._workers_ativos:
+            self._workers_ativos.remove(worker)
+        ao_concluir(ok, resultado)
+
+    worker.concluido.connect(_finalizar)
+    worker.start()
+    return worker
+```
+
+Antigamente, todo lugar que disparava uma chamada de rede fazia `self._worker = SheetsWorker(...)` — um **único** atributo, reaproveitado por Salvar, Remover e Recarregar. Isso funcionava enquanto só uma chamada por vez estava em voo. Mas quando a remoção de linha/produto passou a ser otimista (a linha some da tela na hora, sem esperar a rede — ver "Remover uma linha", abaixo), ficou fácil disparar uma segunda chamada (outra remoção, um Salvar) **antes** da primeira responder. Como `self._worker` é um único atributo, a segunda chamada sobrescrevia a referência à primeira `QThread`, que — ainda rodando em segundo plano, sem nenhuma referência Python a mantê-la viva — podia ser destruída pelo coletor de lixo no meio da execução, e isso arrisca derrubar o app.
+
+A correção substitui esse atributo único por uma **lista** (`self._workers_ativos`), com todo disparo de worker passando por `_disparar_worker`: o worker novo entra na lista assim que é criado e só sai dela quando termina (`_finalizar`, chamado antes do callback de negócio de verdade). Assim, não importa quantas chamadas estejam em voo ao mesmo tempo — cada uma continua tendo uma referência Python válida até terminar. Essa mesma função (e a mesma lista) existem, de forma independente, também em `ProductListPage` (ver [Seção 9](#9-página-2--lista-de-produtos-productlistpage)).
+
+Além disso, `self._remocoes_em_andamento` (um contador, não um booleano) é incrementado quando uma remoção começa e decrementado quando ela termina — `_salvar` e `_recarregar_do_sheets` agora recusam começar enquanto esse contador for maior que zero, porque os dois dependem de números de linha que uma remoção em andamento pode deslocar. Remoções não bloqueiam **umas às outras** (cada uma cuida só da sua própria linha/produto, de forma independente).
 
 ### 🆕 `_destruida` e `marcar_destruida()` — a correção do crash
 
@@ -526,8 +556,36 @@ Monta, de cima para baixo:
 1. Pega a linha selecionada; se nenhuma estiver selecionada, avisa e para.
 2. Se a linha **não tem ID** (nunca foi salva no Sheets), remove localmente na hora — não há nada pra apagar remotamente.
 3. Se **tem ID**, pede confirmação (`QMessageBox.question`), já que isso vai apagar um dado real da planilha.
-4. Confirmado, dispara um `SheetsWorker(sheets_remover, [id_linha])` e bloqueia a tela até a resposta.
-5. Quando o worker termina, `_on_remocao_concluida` **primeiro verifica `self._destruida` 🆕** e, se a página ainda estiver viva, remove a linha da tabela (se deu certo) ou mostra o erro (se falhou).
+4. **Remoção otimista:** a linha some da tabela **na hora**, antes mesmo da rede responder — sem bloquear a tela. `_disparar_worker(sheets_remover, [id_linha], ...)` roda a chamada em segundo plano; `self._remocoes_em_andamento` é incrementado enquanto ela está em voo.
+5. Quando o worker termina, `_on_remocao_concluida` primeiro decrementa `_remocoes_em_andamento`, depois verifica `self._destruida` 🆕 e, se a página ainda estiver viva: em caso de sucesso só atualiza a mensagem de status (a linha já sumiu); em caso de falha, **desfaz** a remoção chamando `_adicionar_linha(dados_removidos)` de volta e mostra o erro.
+
+🆕⁴ **`_snapshot_linha(row)` e `_esquecer_edicao(row)` — os dois cuidados extras da remoção otimista:**
+
+```python
+def _snapshot_linha(self, row: int) -> dict:
+    qtd_txt = self._texto_celula(row, COL_QTD)
+    preco_txt = self._texto_celula(row, COL_PRECO_UNIT)
+    item_data = self.tabela.item(row, COL_DATA)
+    return {
+        "id": self._id_da_linha(row),
+        "data": self._texto_celula(row, COL_DATA),
+        "quantidade": qtd_txt,
+        "preco_unitario": preco_txt,
+        "preco_total": parse_numero(qtd_txt) * parse_numero(preco_txt),
+        "_editada": item_data is not None and id(item_data) in self._itens_editados,
+    }
+```
+
+Antes de remover a linha da tela, `_snapshot_linha` guarda tudo que é preciso pra restaurá-la caso a remoção falhe — inclusive `preco_total` (a primeira versão não guardava isso, e a linha restaurada aparecia com "R$ 0,00" no Total até o usuário editar de novo) e uma flag interna `_editada`, que lembra se essa linha tinha uma edição pendente de salvar. Se a remoção falhar e a linha voltar, `_on_remocao_concluida` usa essa flag pra também restaurar a marca de "editada" (`self._itens_editados`) — sem isso, uma edição feita antes de tentar remover a linha seria silenciosamente esquecida (o próximo Salvar não a reenviaria).
+
+```python
+def _esquecer_edicao(self, row: int):
+    item_data = self.tabela.item(row, COL_DATA)
+    if item_data is not None:
+        self._itens_editados.discard(id(item_data))
+```
+
+Chamada logo antes de toda remoção (com ou sem confirmação de rede). O rastreamento de "linha editada" (ver "Salvar", abaixo) guarda o `id()` do objeto Python do item da coluna Data — o endereço de memória dele. Quando um item é destruído (por exemplo, ao remover a linha), o Python pode **reciclar** aquele mesmo endereço depois, pra um item completamente diferente. Sem esse "esquecimento" prévio, uma linha nunca tocada pelo usuário podia acabar marcada como "editada" por coincidência, e ser reenviada ao Sheets à toa no próximo Salvar.
 
 ### Recalcular ao editar (`_on_item_changed` → `_recalcular_linha` → `_atualizar_indicadores`)
 
@@ -565,16 +623,44 @@ O botão "← Voltar" não chama mais `voltar_callback` diretamente — ele pass
 
 ### Salvar (`_salvar` → `_on_salvamento_concluido`)
 
-1. Percorre todas as linhas da tabela, ignorando qualquer uma com quantidade ou preço inválido/zerado (linhas em branco não são enviadas).
-2. Para cada linha válida, monta um dicionário `registro` com `data`, `quantidade`, `preco_unitario`, `preco_total`.
-3. Se a linha já tiver um ID (via `_id_da_linha`), ela é uma **atualização** → vai para a lista `existentes`. Senão, gera um novo ID (`gerar_id`), adiciona `empresa`/`produto` ao registro (necessário para o Sheets saber onde inserir) e vai para a lista `novas`. Também guarda, em `linhas_por_id_novo`, qual linha da tabela corresponde a cada novo ID — é assim que depois o código sabe onde "gravar de volta" o ID recém-criado.
-4. Se não houver nada pra enviar, apenas avisa e para.
-5. Caso contrário, dispara `SheetsWorker(sheets_salvar, novas, existentes)`.
-6. Quando termina, `_on_salvamento_concluido` **primeiro verifica `self._destruida` 🆕** e, se a página ainda estiver viva, grava o ID de cada linha nova de volta no `UserRole` dela (usando o mapa `linhas_por_id_novo`) — assim, se o usuário salvar de novo sem recarregar, essas linhas já são reconhecidas como "existentes" em vez de criar duplicatas.
+1. Recusa começar se `_operacao_em_andamento` ou `_remocoes_em_andamento > 0` (🆕⁴ — uma remoção em andamento pode deslocar os números de linha que este salvamento está prestes a usar).
+2. Percorre todas as linhas da tabela, ignorando qualquer uma com quantidade ou preço inválido/zerado (linhas em branco não são enviadas).
+3. Para cada linha válida **e ou nova ou marcada como editada** (`self._itens_editados` — ver abaixo), monta um dicionário `registro` com `data`, `quantidade`, `preco_unitario`, `preco_total`.
+4. Se a linha já tiver um ID (via `_id_da_linha`), ela é uma **atualização** → vai para a lista `existentes`. Senão, gera um novo ID (`gerar_id`), adiciona `empresa`/`produto` ao registro (necessário para o Sheets saber onde inserir) e vai para a lista `novas`. Também guarda, em `linhas_por_id_novo`, qual linha da tabela corresponde a cada novo ID, e em `itens_enviados` o `id()` de cada linha realmente incluída no envio.
+5. Se não houver nada pra enviar, apenas avisa e para.
+6. Caso contrário, dispara `_disparar_worker(sheets_salvar, novas, existentes, ...)`.
+7. Quando termina, `_on_salvamento_concluido` primeiro verifica `self._destruida` 🆕 e, se a página ainda estiver viva, grava o ID de cada linha nova de volta no `UserRole` dela (usando o mapa `linhas_por_id_novo`) — assim, se o usuário salvar de novo sem recarregar, essas linhas já são reconhecidas como "existentes" em vez de criar duplicatas.
+
+### `_itens_editados` — só reenvia o que realmente mudou
+
+```python
+if id_linha and id(item_data) not in self._itens_editados:
+    continue  # já está salva e não foi tocada — não reenvia à toa
+```
+
+`self._itens_editados` é um `set` com o `id()` (endereço de memória do objeto Python) do item da coluna Data de cada linha que o **usuário** editou desde o último carregamento/salvamento (marcado em `_on_item_changed`, sempre que `_carregando` não estiver ativo). Sem isso, todo clique em Salvar reenviaria **todas** as compras já salvas daquele produto, mesmo as que não mudaram — desperdiçando chamadas ao Apps Script (e tempo) à toa. Linhas novas (sem ID) sempre são enviadas, independente dessa marca.
+
+🆕⁴ **Como o resultado do envio afeta `_itens_editados` (`_on_salvamento_concluido`):**
+
+```python
+if ids_nao_encontrados:
+    ...
+    self._itens_editados -= (itens_enviados - itens_com_problema)
+    self._alteracoes_nao_salvas = bool(self._itens_editados)
+    ...
+else:
+    self._itens_editados -= itens_enviados
+    self._alteracoes_nao_salvas = bool(self._itens_editados)
+    ...
+```
+
+A primeira versão desse recurso, ao salvar com sucesso, simplesmente zerava `self._itens_editados` por inteiro (`= set()`). Isso tinha um problema: como a tabela continua editável enquanto um Salvar está em andamento (só os botões ficam desabilitados), uma edição feita **durante** esse tempo tinha sua marca apagada junto — e o próximo Salvar a ignorava, achando que já estava tudo em dia, perdendo a edição em silêncio. A correção troca a limpeza total por uma **subtração**: só os `itens_enviados` (as linhas que realmente fizeram parte deste envio) saem do conjunto; qualquer edição concorrente, feita numa linha diferente enquanto o envio acontecia, continua marcada.
+
+Além disso, se o Apps Script devolver `idsNaoEncontrados` (ver acima e [Seção 14](#14-backend-apps-script-apps_script_backendgs-)) — linhas "existentes" que não foram achadas na planilha e por isso não foram atualizadas — essas linhas específicas **continuam** marcadas como editadas (não somem do `_itens_editados`), `_alteracoes_nao_salvas` volta a `True`, e um aviso (`QMessageBox.warning` + status vermelho) avisa quantas linhas ficaram pendentes, em vez do app assumir silenciosamente que tudo foi salvo.
 
 ### Recarregar do Sheets (`_recarregar_do_sheets` → `_on_recarregamento_concluido`)
 
-Busca de novo todos os registros da empresa e filtra só os do produto atual (`linha.get("produto") == self.produto`), repopulando a tabela do zero — útil se outra pessoa alterou a planilha por fora do app. `_on_recarregamento_concluido` também **verifica `self._destruida` 🆕** antes de tocar em qualquer widget.
+Busca de novo todos os registros da empresa e filtra só os do produto atual (`linha.get("produto") == self.produto`), repopulando a tabela do zero — útil se outra pessoa alterou a planilha por fora do app. Assim como `_salvar`, 🆕⁴ recusa começar se `_operacao_em_andamento` ou `_remocoes_em_andamento > 0` (repopular a tabela do zero enquanto uma remoção ainda não confirmou bagunçaria as premissas dela). `_on_recarregamento_concluido` também **verifica `self._destruida` 🆕** antes de tocar em qualquer widget.
 
 ---
 
@@ -587,10 +673,14 @@ Mostra todos os produtos de uma empresa, com a data e o valor da última compra 
 ```python
 self._linhas_por_produto = {}   # nome do produto -> lista de linhas da planilha
 self._produtos_pendentes = []   # produtos criados nesta sessão, sem compra salva ainda
+self._workers_ativos = []       # 🆕⁴ ver _disparar_worker na Seção 8
+self._remocoes_em_andamento = 0  # 🆕⁴ ver _disparar_worker na Seção 8
 self._ordem_crescente = True    # A-Z ou Z-A
 self._texto_pesquisa = ""
 self._geracao_carregamento = 0  # usado pelo watchdog de timeout (ver abaixo)
 ```
+
+🆕⁴ Essa página tem sua própria cópia de `_disparar_worker` (idêntica à de `ProductEntriesPage`, ver [Seção 8](#8-página-3--compras-de-um-produto-producteentriespage)) — mesma lógica de manter uma referência forte a cada `SheetsWorker` em `_workers_ativos` até ele terminar, evitando que uma segunda chamada (por exemplo, remover dois produtos rapidamente) sobrescreva a referência à primeira `QThread` ainda rodando.
 
 `_produtos_pendentes` existe porque, quando o usuário cria um produto novo pelo botão "Adicionar novo item", esse produto **ainda não existe na planilha** (só passa a existir quando a primeira compra é salva). Enquanto isso, ele fica "pendurado" nessa lista, só para continuar aparecendo na tabela.
 
@@ -598,7 +688,7 @@ self._geracao_carregamento = 0  # usado pelo watchdog de timeout (ver abaixo)
 
 ```python
 def recarregar(self):
-    if self._operacao_em_andamento:
+    if self._operacao_em_andamento or self._remocoes_em_andamento > 0:
         return
 
     # 1) Mostra na hora o que já temos em cache local, sem esperar a rede.
@@ -616,11 +706,11 @@ def recarregar(self):
     # 2) Em paralelo, busca a versão atual no Sheets pra confirmar/atualizar.
     self._definir_ocupado(True)
     ...
-    self._worker = SheetsWorker(sheets_buscar, self.empresa["nome"])
-    self._worker.concluido.connect(self._on_carregamento_concluido)
-    self._worker.start()
+    self._disparar_worker(sheets_buscar, self.empresa["nome"], ao_concluir=self._on_carregamento_concluido)
     ...
 ```
+
+🆕⁴ O guard `_remocoes_em_andamento > 0` evita repopular a tabela do zero enquanto uma remoção de produto ainda não confirmou — se a busca ao Sheets ainda trouxer o produto que está sendo removido (porque o cache de 60s do backend ainda não expirou, por exemplo), ele reapareceria na tela até a remoção terminar e escondê-lo de novo, um estado confuso que esse guard evita simplesmente adiando o recarregamento.
 
 Essa é a principal mudança de performance percebida do app: antes, `recarregar()` sempre mostrava "Carregando..." e ficava esperando a resposta da rede pra desenhar qualquer coisa. Agora, se existir um cache local daquela empresa (ver [Seção 5](#5-cache-local-em-disco-)), a tabela é populada **imediatamente** com esses dados, e só depois a busca real ao Sheets é disparada em segundo plano pra confirmar/atualizar. O usuário passa a ver dados quase instantaneamente ao trocar de empresa, mesmo que a rede ou o Apps Script demorem alguns segundos para responder.
 
@@ -665,7 +755,7 @@ Para cada produto, busca a última compra com `obter_ultima_compra` e mostra sua
 ### Adicionar e remover produtos
 
 - **`_adicionar_produto`**: abre um `QInputDialog` pedindo o nome, valida que não é vazio nem duplicado, e adiciona à lista `_produtos_pendentes`. 🆕² Em seguida chama `self._abrir_produto(nome)` — o produto recém-criado é aberto na hora, direto na tela de compras, sem o usuário precisar localizá-lo na lista (que pode estar ordenada ou filtrada de um jeito que o esconda).
-- **`_remover_produto`**: se o produto **não tem nenhum ID** (é só "pendente", nunca foi salvo), remove localmente sem chamar o Sheets. Se **tem IDs**, pede confirmação e dispara `sheets_remover` com a lista de todos os IDs daquele produto de uma vez (remove todas as compras do produto na mesma chamada).
+- **`_remover_produto`**: se o produto **não tem nenhum ID** (é só "pendente", nunca foi salvo), remove localmente sem chamar o Sheets. Se **tem IDs**, pede confirmação e faz uma **remoção otimista**: o produto some da lista (`self._linhas_por_produto.pop(...)` + `_reconstruir_tabela()`) **antes** da rede confirmar, e só então `_disparar_worker` dispara `sheets_remover` com todos os IDs daquele produto de uma vez. 🆕⁴ `self._remocoes_em_andamento` é incrementado antes de disparar e decrementado no início de `_on_remocao_produto_concluida` — usado por `recarregar()` (ver abaixo) pra saber que uma remoção ainda não confirmou. Se a remoção falhar, o produto (com as linhas originais) volta pra `_linhas_por_produto` e a tabela é reconstruída de novo.
 
 ---
 
@@ -808,9 +898,79 @@ ID | Empresa | Produto | Data | Quantidade | Preço Unitário | Preço Total
 
 🆕 O array `CABECALHO` foi corrigido para refletir essas 7 colunas de verdade — na versão anterior ele só listava 5 nomes, o que não batia com o que era realmente gravado.
 
-### `getPlanilha()` / `lerTodasLinhasDaPlanilha()`
+### 🆕⁴ `getPlanilha()` — presa numa aba fixa, não na aba "ativa"
 
-`getPlanilha()` pega a aba ativa da planilha, criando o cabeçalho se ela estiver totalmente vazia. `lerTodasLinhasDaPlanilha()` lê a planilha inteira **de uma vez** (`getDataRange().getValues()`) e converte cada linha num objeto JS `{id, empresa, produto, data, quantidade, preco_unitario, preco_total}`, pulando linhas sem ID (vazias).
+```javascript
+function getPlanilha() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var props = PropertiesService.getScriptProperties();
+  var idAbaFixada = props.getProperty("ID_ABA_DADOS");
+
+  var planilha = null;
+  if (idAbaFixada) {
+    var idNumerico = Number(idAbaFixada);
+    var abas = ss.getSheets();
+    for (var i = 0; i < abas.length; i++) {
+      if (abas[i].getSheetId() === idNumerico) { planilha = abas[i]; break; }
+    }
+  }
+
+  if (!planilha) {
+    planilha = ss.getActiveSheet();
+    props.setProperty("ID_ABA_DADOS", String(planilha.getSheetId()));
+  }
+
+  if (planilha.getLastRow() === 0) {
+    planilha.appendRow(CABECALHO);
+  }
+  garantirFormatoTexto(planilha);
+  return planilha;
+}
+```
+
+**O bug:** a versão anterior usava `SpreadsheetApp.getActiveSpreadsheet().getActiveSheet()` — "a aba que estiver aberta no navegador nesse momento". Se a planilha tivesse mais de uma aba (por exemplo, uma aba de resumo além da de dados) e alguém clicasse na outra aba, a próxima leitura/escrita do app acontecia **na aba errada**, sem nenhum erro aparecer — os dados "sumiam" ou eram gravados no lugar errado.
+
+**A correção:** na primeira execução, `getPlanilha()` guarda o `getSheetId()` da aba usada (um número interno que não muda mesmo que a aba seja renomeada) numa **Script Property** (`ID_ABA_DADOS` — configuração que persiste entre execuções do Apps Script, independente da planilha). Nas próximas vezes, ele procura a aba com esse ID entre todas as abas da planilha, ignorando qual estiver "ativa" no navegador. Pra apontar pra uma aba diferente no futuro, basta apagar essa Script Property em *Configurações do projeto → Propriedades do script* — a próxima execução vai fixar de novo, na aba que estiver ativa naquele momento.
+
+### 🆕⁴ `garantirFormatoTexto(planilha)` — corrige a raiz de dois bugs de conversão automática
+
+```javascript
+function garantirFormatoTexto(planilha) {
+  var props = PropertiesService.getScriptProperties();
+  var chave = "FORMATO_TEXTO_APLICADO_" + planilha.getSheetId();
+  if (props.getProperty(chave) === "1") return;
+  planilha.getRange("A:A").setNumberFormat("@"); // ID
+  planilha.getRange("D:D").setNumberFormat("@"); // Data
+  props.setProperty(chave, "1");
+}
+```
+
+O Google Sheets "adivinha" o tipo de uma célula pelo que parece ter sido digitado nela — mesmo quando o valor chega via API (`setValues()`), não digitado por uma pessoa. Isso causava dois bugs:
+
+- Um **ID** gerado por `gerar_id()` (hexadecimal: `0-9` e `a-f`) que, por acaso, só tivesse dígitos (ex: `"012345678901"`) podia ser convertido pro **número** `12345678901` — perdendo o zero à esquerda. Da próxima vez que o app tentasse editar/remover essa linha usando o ID original (com o zero), a busca no índice (`construirIndiceIds`) nunca batia, e a operação era silenciosamente ignorada.
+- Uma **Data** enviada como texto (`"10/08/2026"`) podia virar uma data de verdade — o que trazia o bug de fuso horário explicado logo abaixo.
+
+A correção formata as colunas **A** (ID) e **D** (Data) como **texto puro** (`"@"`) assim que a aba é preparada, então o Sheets nunca mais tenta "converter" nada escrito nelas — o texto exato que o app manda é o texto exato que fica gravado. Roda só uma vez por aba (controlado por outra Script Property), então não pesa nas chamadas seguintes.
+
+### 🆕⁴ `normalizarDataLida(valor)` — corrige mesmo linhas já convertidas antes dessa correção
+
+```javascript
+function normalizarDataLida(valor) {
+  if (Object.prototype.toString.call(valor) === "[object Date]") {
+    var fuso = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+    return Utilities.formatDate(valor, fuso, "dd/MM/yyyy");
+  }
+  return valor;
+}
+```
+
+Formatar a coluna como texto (acima) evita que **novas** datas sejam convertidas, mas não desfaz o que já tinha sido convertido **antes** dessa correção existir — uma célula que já é um objeto `Date` de verdade continua sendo um `Date`, format de coluna ou não. Se `lerTodasLinhasDaPlanilha` simplesmente devolvesse esse `Date` pro JSON, o `JSON.stringify()` do JavaScript chama `toISOString()` nele — que é **sempre em UTC**. Numa planilha configurada num fuso à frente de UTC (comum fora do Brasil), a meia-noite local de `10/08` vira algo como `"2026-08-09T23:00:00.000Z"` — um timestamp do dia **anterior**. O `normalizar_data_sheets` do lado Python (ver [Seção 3](#3-funções-utilitárias)) só pega a parte da data desse texto, então a compra salva como `10/08` reaparecia como `09/08` — silenciosamente, sem nenhum erro.
+
+A correção detecta esse caso (`Object.prototype.toString.call(valor) === "[object Date]"`) e formata a data de volta usando o **fuso horário configurado na própria planilha** (`getSpreadsheetTimeZone()`) — o mesmo fuso que a pessoa vê ao abrir a planilha no navegador — em vez de deixar o JavaScript serializar em UTC. Isso corrige o problema tanto pra linhas antigas (já convertidas) quanto serve de rede de segurança pra qualquer célula que escape da formatação de texto por algum motivo (por exemplo, editada manualmente por uma pessoa direto na planilha).
+
+### `lerTodasLinhasDaPlanilha()`
+
+Lê a planilha inteira **de uma vez** (`getDataRange().getValues()`) e converte cada linha num objeto JS `{id, empresa, produto, data, quantidade, preco_unitario, preco_total}`, pulando linhas sem ID (vazias). 🆕⁴ `id` agora sempre passa por `String(...)` (nunca deixa um ID todo numérico virar `Number` na resposta) e `data` passa por `normalizarDataLida` (explicado acima).
 
 ### 🆕 Cache de leitura (`cacheSalvarLista` / `cacheCarregarLista` / `invalidarCache`)
 
@@ -876,7 +1036,32 @@ function construirIndiceIds(planilha) {
 
 Antes, cada atualização ou remoção fazia sua **própria** varredura da coluna A inteira pra achar a linha correspondente àquele ID — se você salvasse 10 linhas existentes numa planilha de 5.000 linhas, isso significava 10 leituras de 5.000 células cada. Agora, essa varredura acontece **uma única vez por requisição**, construindo um mapa `{id: número_da_linha}` que é reaproveitado por todas as atualizações/remoções daquela chamada. Isso muda o custo de O(n × m) para O(n + m), o que faz muita diferença numa "lista imensa".
 
-### `doPost(e)` / `salvarRegistros` / `removerRegistros`
+### 🆕⁴ `doPost(e)` — agora serializado com `LockService`
+
+```javascript
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+  } catch (erro) {
+    return responder({ ok: false, erro: "Servidor ocupado, tente novamente em instantes." });
+  }
+  try {
+    var planilha = getPlanilha();
+    ...
+  } catch (erro) {
+    return responder({ ok: false, erro: String(erro) });
+  } finally {
+    lock.releaseLock();
+  }
+}
+```
+
+**O bug:** nada impedia duas execuções do `doPost` (duas chamadas simultâneas do app, ou do app + de outra aba/dispositivo) de rodar ao mesmo tempo. Cada uma constrói seu próprio índice de linhas (`construirIndiceIds`) no início — se uma delas remover linhas (deslocando tudo que vem depois pra cima) enquanto a outra ainda está usando um índice construído **antes** dessa remoção, a segunda `setValues()` acaba caindo numa linha deslocada, sobrescrevendo os dados de um registro errado.
+
+**A correção:** `LockService.getScriptLock()` garante que só uma execução do `doPost` mexa na planilha por vez — as outras esperam (até 10s) a vez delas, em vez de rodar em paralelo e disputar os mesmos números de linha. `doGet` (só leitura) não usa lock, pra não deixar as buscas mais lentas à toa.
+
+### `salvarRegistros` / `removerRegistros`
 
 ```javascript
 function salvarRegistros(planilha, novas, existentes) {
@@ -888,19 +1073,32 @@ function salvarRegistros(planilha, novas, existentes) {
     planilha.getRange(linhaInicial, 1, dados.length, NUM_COLUNAS).setValues(dados);
   }
 
-  if (existentes.length > 0) {
-    var indice = construirIndiceIds(planilha);
-    existentes.forEach(function (l) {
-      var linhaIndex = indice[String(l.id)];
-      if (linhaIndex) {
-        planilha.getRange(linhaIndex, 4, 1, 4).setValues([[l.data, l.quantidade, l.preco_unitario, l.preco_total]]);
-      }
-    });
-  }
+  if (existentes.length === 0) return { idsNaoEncontrados: [] };
+
+  var indice = construirIndiceIds(planilha);
+  var linhasAlvo = [];
+  var idsNaoEncontrados = [];
+  existentes.forEach(function (l) {
+    var linha = indice[String(l.id)];
+    if (linha) {
+      linhasAlvo.push({ linha: linha, dados: l });
+    } else {
+      idsNaoEncontrados.push(l.id);
+    }
+  });
+
+  // ... grava linhasAlvo (1 chamada se for só uma linha, ou um bloco de
+  // leitura+escrita se forem várias — ver otimização de desempenho abaixo)
+
+  return { idsNaoEncontrados: idsNaoEncontrados };
 }
 ```
 
-🆕 As linhas **novas** deixaram de ser gravadas com um `appendRow()` por linha (cada um sendo uma chamada separada à API do Sheets) e passaram a ser gravadas todas de uma vez, com um único `setValues()` numa faixa de células contígua começando logo após a última linha usada. As linhas **existentes** usam o índice construído uma única vez, como explicado acima.
+🆕 As linhas **novas** deixaram de ser gravadas com um `appendRow()` por linha (cada um sendo uma chamada separada à API do Sheets) e passaram a ser gravadas todas de uma vez, com um único `setValues()` numa faixa de células contígua começando logo após a última linha usada.
+
+🆕⁴ **`idsNaoEncontrados` — parar de descartar edições em silêncio.** Antes, um `existentes.map(...).filter(...)` simplesmente **descartava** qualquer linha cujo ID não estivesse no índice (por exemplo, apagada por outra sessão entre o usuário editar e clicar Salvar) — e `doPost` respondia `{ ok: true }` do mesmo jeito, como se tudo tivesse sido salvo. Agora `salvarRegistros` separa esses casos em `idsNaoEncontrados` e devolve essa lista; `doPost` repassa ela na resposta (`{ ok: true, idsNaoEncontrados: [...] }`), e o Python (`ProductEntriesPage._on_salvamento_concluido`, ver [Seção 8](#8-página-3--compras-de-um-produto-producteentriespage)) usa essa informação pra manter essas linhas específicas marcadas como pendentes, em vez de assumir que está tudo salvo.
+
+Pra **várias** linhas existentes editadas na mesma chamada, em vez de uma `setValues()` por linha, o código lê o bloco do menor ao maior número de linha de uma vez, atualiza só as linhas alvo em memória, e grava tudo de volta com um único `setValues()` — trocamos ler/escrever algumas células a mais (as linhas do meio que não mudaram) por bem menos chamadas à planilha, que é o que realmente pesa no tempo de resposta. Pra uma linha só (o caso mais comum), grava direto, sem essa leitura extra.
 
 ```javascript
 function removerRegistros(planilha, ids) {
@@ -912,14 +1110,25 @@ function removerRegistros(planilha, ids) {
     if (linhaIndex) linhasParaRemover.push(linhaIndex);
   });
   linhasParaRemover.sort(function (a, b) { return b - a; });
-  linhasParaRemover.forEach(function (linhaIndex) {
-    planilha.deleteRow(linhaIndex);
-  });
+
+  // agrupa linhas vizinhas num único deleteRows(), em vez de um deleteRow()
+  // por linha
+  var i = 0;
+  while (i < linhasParaRemover.length) {
+    var fimBloco = linhasParaRemover[i];
+    var tamanhoBloco = 1;
+    while (i + tamanhoBloco < linhasParaRemover.length &&
+           linhasParaRemover[i + tamanhoBloco] === fimBloco - tamanhoBloco) {
+      tamanhoBloco++;
+    }
+    planilha.deleteRows(fimBloco - tamanhoBloco + 1, tamanhoBloco);
+    i += tamanhoBloco;
+  }
   return linhasParaRemover.length;
 }
 ```
 
-Mesma lógica: o índice é construído uma vez, todas as linhas a remover são localizadas nele, e só então são apagadas — de baixo para cima, pra não bagunçar os índices das linhas seguintes ao deletar.
+Mesma lógica de índice único, mas com um cuidado a mais: linhas **vizinhas** na planilha (números consecutivos, comum quando um produto teve todas as suas compras salvas de uma vez) são agrupadas num único `deleteRows(inicio, quantidade)`, em vez de um `deleteRow()` por linha — menos chamadas à planilha quando é possível, sem mudar o resultado (a remoção continua acontecendo de baixo para cima, pra não bagunçar os índices das linhas seguintes).
 
 Por fim, `doPost` chama `invalidarCache()` depois de qualquer `salvar` ou `remover` bem-sucedido, garantindo que a próxima leitura (`doGet`) já reflita os dados novos, em vez de servir uma versão em cache desatualizada.
 
@@ -943,3 +1152,8 @@ Por fim, `doPost` chama `invalidarCache()` depois de qualquer `salvar` ou `remov
 | 🆕² **`_alteracoes_nao_salvas`** | Flag na `ProductEntriesPage` que rastreia edições ainda não enviadas ao Sheets, usada por `_tentar_voltar` para confirmar antes de sair da tela |
 | 🆕³ **`minimumSizeHint()`** | Método do Qt que informa ao layout o menor tamanho aceitável de um widget; sobrescrito em `LabelElidavel` pra não crescer junto com o texto, permitindo a elisão de verdade |
 | 🆕³ **Hint de `closeEditor`** | Sinal que o Qt manda pra view avisando qual tecla fechou o editor de uma célula; o do Enter tem o nome oficial `SubmitModelData`, mas aparece como `SubmitModelCache` em algumas versões do PyQt6 |
+| 🆕⁴ **`_disparar_worker`** | Método (em `ProductEntriesPage` e `ProductListPage`) que dispara um `SheetsWorker` mantendo-o numa lista (`_workers_ativos`) até terminar, evitando que uma segunda chamada em paralelo sobrescreva a referência à primeira `QThread` ainda rodando |
+| 🆕⁴ **`_remocoes_em_andamento`** | Contador de remoções ainda não confirmadas; `_salvar`/`_recarregar_do_sheets` (e o `recarregar` da lista de produtos) recusam começar enquanto ele for maior que zero |
+| 🆕⁴ **`ID_ABA_DADOS`** | Script Property do Apps Script que guarda o `getSheetId()` da aba "fixada" — usada por `getPlanilha()` pra sempre voltar na mesma aba, em vez de seguir a aba "ativa" no navegador |
+| 🆕⁴ **`idsNaoEncontrados`** | Lista devolvida por `salvarRegistros`/`doPost` com os IDs "existentes" que não foram achados na planilha — o Python usa isso pra manter essas linhas específicas como pendentes, em vez de assumir que tudo foi salvo |
+| 🆕⁴ **`LockService`** | Serviço do Apps Script usado em `doPost` pra impedir que duas requisições de escrita rodem ao mesmo tempo e disputem os mesmos números de linha |
