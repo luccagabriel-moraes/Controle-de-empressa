@@ -10,9 +10,10 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QLabel, QTableWidget, QTableWidgetItem,
-    QHeaderView, QMessageBox, QAbstractItemView, QDateEdit, QInputDialog, QLineEdit
+    QHeaderView, QMessageBox, QAbstractItemView, QDateEdit, QInputDialog, QLineEdit,
+    QAbstractItemDelegate
 )
-from PyQt6.QtCore import Qt, QDate, QRectF, QPointF, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QDate, QSize, QRectF, QPointF, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QColor, QPixmap, QPainter, QPainterPath, QPen, QLinearGradient
 
 
@@ -25,10 +26,9 @@ ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 
 # URL do Web App do Google Apps Script (termina em "/exec").
-GOOGLE_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzG0MwJ3miFutupkYbY-jIlovE-TkXbVS0qBNRpXTx_No5nbA_67JUOl6orr6042-bjyw/exec"
+GOOGLE_SHEETS_WEBHOOK_URL = ""
 
-# Cada empresa tem: nome, cor principal, cor do texto sobre essa cor, e o
-# caminho da logo (ou None para usar um ícone/texto).
+# nome, cor de destaque, cor do texto sobre essa cor e o caminho da logo (None = ícone/texto)
 COMPANIES = [
     {
         "nome": "Granola Pura",
@@ -59,7 +59,7 @@ BORDA_ESPESSURA = 3
 COLUNAS_ENTRADAS = ["Data", "Quantidade", "Preço Unitário", "Preço Total"]
 COL_DATA, COL_QTD, COL_PRECO_UNIT, COL_TOTAL = range(4)
 
-ROWS_INICIAIS = 3  # linhas em branco ao abrir um produto novo/sem registros
+ROWS_INICIAIS = 1  # linhas em branco ao abrir um produto novo/sem registros
 
 
 # --------------------------------------------------------------------------- #
@@ -88,9 +88,9 @@ def gerar_id() -> str:
 
 
 def normalizar_data_sheets(valor) -> str:
-    """O Sheets costuma converter a data enviada ('dd/MM/yyyy') em uma data
-    real, que volta em ISO com horário (ex: '2026-07-01T03:00:00.000Z').
-    Aqui detectamos esse formato e devolvemos só o dia, em dd/MM/yyyy."""
+    """O Sheets às vezes converte a data enviada em data real e devolve em
+    ISO (ex: '2026-07-01T03:00:00.000Z'); aqui convertemos de volta pra
+    dd/MM/yyyy."""
     texto = str(valor if valor is not None else "").strip()
     if not texto:
         return ""
@@ -121,11 +121,8 @@ def obter_ultima_compra(linhas_produto: list):
 # --------------------------------------------------------------------------- #
 # Cache local (deixa a lista aparecer na hora, mesmo antes do Sheets responder)
 # --------------------------------------------------------------------------- #
-# Guardamos em disco a última lista de cada empresa. Ao abrir uma empresa, a
-# tabela é populada instantaneamente com o que está em cache, e uma busca
-# real ao Sheets roda em paralelo pra atualizar tudo assim que chegar.
-# Isso não resolve lentidão do Apps Script em si, mas tira o "tempo de
-# espera" da experiência do usuário na maioria das vezes.
+# Guarda em disco a última lista de cada empresa: a tela mostra isso na hora
+# e atualiza em paralelo assim que o Sheets responder.
 
 def _cache_arquivo(empresa: str) -> str:
     nome_seguro = "".join(c if c.isalnum() else "_" for c in empresa)
@@ -156,8 +153,7 @@ def cache_salvar(empresa: str, linhas: list):
 # --------------------------------------------------------------------------- #
 # Integração com Google Sheets
 # --------------------------------------------------------------------------- #
-# Funções puras (sem Qt) que chamam a API. Rodam dentro de SheetsWorker
-# (QThread) para não travar a interface enquanto a rede responde.
+# Funções puras (sem Qt), executadas em segundo plano por SheetsWorker.
 
 class ErroSheets(Exception):
     """Erro de comunicação com o Google Sheets (rede, configuração ou o
@@ -310,6 +306,45 @@ def criar_avatar_circular(empresa: dict, tamanho: int = 130) -> QLabel:
 
 
 # --------------------------------------------------------------------------- #
+# Rótulo que trunca texto longo (em vez de desalinhar o layout)
+# --------------------------------------------------------------------------- #
+
+class LabelElidavel(QLabel):
+    """QLabel que trunca o próprio texto com reticências quando não cabe no
+    espaço disponível, em vez de empurrar o resto do layout. O texto completo
+    continua acessível via tooltip.
+
+    `minimumSizeHint()` é sobrescrito pra nunca acompanhar o texto atual —
+    senão um texto grande travaria o layout num mínimo grande antes mesmo do
+    primeiro redimensionamento, e a label nunca chegaria a encolher."""
+
+    def __init__(self, texto: str = "", parent=None):
+        super().__init__(parent)
+        self._texto_completo = ""
+        self.setText(texto)
+
+    def setText(self, texto: str):
+        self._texto_completo = texto
+        self.setToolTip(texto)
+        super().setText(texto)
+        self._reelidir()
+
+    def minimumSizeHint(self):
+        largura_minima = self.fontMetrics().horizontalAdvance("...")
+        return QSize(largura_minima, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reelidir()
+
+    def _reelidir(self):
+        texto_elidido = self.fontMetrics().elidedText(
+            self._texto_completo, Qt.TextElideMode.ElideRight, self.width()
+        )
+        super().setText(texto_elidido)
+
+
+# --------------------------------------------------------------------------- #
 # Mini gráfico de tendência de preço
 # --------------------------------------------------------------------------- #
 
@@ -406,6 +441,38 @@ class MiniGraficoPreco(QWidget):
 
 
 # --------------------------------------------------------------------------- #
+# Tabela de compras com navegação por Enter
+# --------------------------------------------------------------------------- #
+
+class TabelaComNavegacaoEnter(QTableWidget):
+    """QTableWidget da tela de compras: Enter avança Data -> Quantidade ->
+    Preço Unitário em vez do padrão do Qt. Em Preço Unitário só confirma o
+    valor e para ali, sem criar linha nova."""
+
+    # O hint oficial do Enter se chama "SubmitModelData", mas em algumas
+    # versões do binding PyQt6 aparece como "SubmitModelCache" (erro
+    # conhecido) — tenta o nome oficial e cai pro alternativo.
+    _HINT_ENTER = getattr(
+        QAbstractItemDelegate.EndEditHint, "SubmitModelData", None
+    ) or QAbstractItemDelegate.EndEditHint.SubmitModelCache
+
+    def closeEditor(self, editor, hint):
+        if hint != self._HINT_ENTER:
+            super().closeEditor(editor, hint)
+            return
+
+        row, col = self.currentRow(), self.currentColumn()
+        super().closeEditor(editor, QAbstractItemDelegate.EndEditHint.NoHint)
+
+        proxima_coluna = {COL_DATA: COL_QTD, COL_QTD: COL_PRECO_UNIT}.get(col)
+        if proxima_coluna is None:
+            return  # estava em Preço Unitário: fica parado ali, sem criar linha nova
+
+        self.setCurrentCell(row, proxima_coluna)
+        self.editItem(self.item(row, proxima_coluna))
+
+
+# --------------------------------------------------------------------------- #
 # Página 3: registros (compras) de um produto específico
 # --------------------------------------------------------------------------- #
 
@@ -423,11 +490,10 @@ class ProductEntriesPage(QWidget):
         self._carregando = False
         self._operacao_em_andamento = False
         self._worker = None
-        # Marcada quando a MainWindow decide destruir esta página (por
-        # exemplo, ao abrir outro produto). Todo callback de rede que chega
-        # depois disso deve simplesmente ignorar o resultado, em vez de
-        # tentar mexer em widgets que já não existem mais (isso é o que
-        # causava o "RuntimeError: wrapped C/C++ object ... has been deleted").
+        self._alteracoes_nao_salvas = False  # edição pendente de salvar (ver _tentar_voltar)
+        # True quando a MainWindow já destruiu esta página (ex: abriu outro
+        # produto); callbacks de rede atrasados checam isso antes de mexer
+        # em widgets, evitando o RuntimeError de objeto C++ já deletado.
         self._destruida = False
 
         self._montar_ui()
@@ -444,7 +510,7 @@ class ProductEntriesPage(QWidget):
         layout.addLayout(self._criar_linha_titulo())
         layout.addLayout(self._criar_linha_filtro())
 
-        self.tabela = QTableWidget(0, len(COLUNAS_ENTRADAS))
+        self.tabela = TabelaComNavegacaoEnter(0, len(COLUNAS_ENTRADAS))
         self.tabela.setHorizontalHeaderLabels(COLUNAS_ENTRADAS)
         self.tabela.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tabela.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -474,7 +540,7 @@ class ProductEntriesPage(QWidget):
     def _criar_linha_titulo(self) -> QHBoxLayout:
         linha = QHBoxLayout()
         self.btn_voltar = QPushButton("← Voltar")
-        self.btn_voltar.clicked.connect(lambda: self.voltar_callback())
+        self.btn_voltar.clicked.connect(self._tentar_voltar)
 
         bloco_esquerdo_widget = QWidget()
         bloco_esquerdo = QHBoxLayout(bloco_esquerdo_widget)
@@ -494,7 +560,7 @@ class ProductEntriesPage(QWidget):
         self.mini_grafico = MiniGraficoPreco()
         bloco_esquerdo.addWidget(self.mini_grafico)
 
-        titulo = QLabel(f"{self.empresa['nome']}  ›  {self.produto}")
+        titulo = LabelElidavel(f"{self.empresa['nome']}  ›  {self.produto}")
         fonte_titulo = QFont()
         fonte_titulo.setPointSize(16)
         fonte_titulo.setBold(True)
@@ -575,15 +641,28 @@ class ProductEntriesPage(QWidget):
         )
 
     def _definir_ocupado(self, ocupado: bool, mensagem: str = ""):
-        """Bloqueia os botões enquanto uma chamada de rede está em andamento.
-        Inclui o botão Voltar: sair da tela no meio de um salvamento/remoção
-        era justamente o que deixava a página órfã e causava o crash."""
+        """Bloqueia os botões (inclusive Voltar) enquanto uma chamada de rede
+        está em andamento, pra evitar sair da tela no meio de uma operação."""
         self._operacao_em_andamento = ocupado
         for botao in (self.btn_add, self.btn_remover, self.btn_salvar, self.btn_recarregar, self.btn_voltar):
             botao.setEnabled(not ocupado)
         if mensagem:
             self.status_label.setStyleSheet("color: #d9a441;")
             self.status_label.setText(mensagem)
+
+    def _tentar_voltar(self):
+        """Chamado pelo botão "← Voltar". Se existir alguma alteração ainda
+        não salva (linha nova preenchida ou edição numa linha já existente),
+        pede confirmação antes de sair — evita perder dados por engano."""
+        if self._alteracoes_nao_salvas:
+            resposta = QMessageBox.question(
+                self, "Sair sem salvar",
+                "Você tem alterações que ainda não foram salvas. Quer sair mesmo assim?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if resposta != QMessageBox.StandardButton.Yes:
+                return
+        self.voltar_callback()
 
     def _adicionar_linha(self, dados: dict = None):
         row = self.tabela.rowCount()
@@ -618,6 +697,7 @@ class ProductEntriesPage(QWidget):
                 self._adicionar_linha()
 
         self._atualizar_indicadores()
+        self._alteracoes_nao_salvas = False  # dados recém-carregados: nada para salvar ainda
 
     def _id_da_linha(self, row: int):
         item = self.tabela.item(row, COL_DATA)
@@ -667,6 +747,7 @@ class ProductEntriesPage(QWidget):
     def _on_item_changed(self, item: QTableWidgetItem):
         if self._carregando:
             return
+        self._alteracoes_nao_salvas = True
         if item.column() in (COL_QTD, COL_PRECO_UNIT):
             self._recalcular_linha(item.row())
         self._atualizar_indicadores()
@@ -800,6 +881,7 @@ class ProductEntriesPage(QWidget):
                 if item:
                     item.setData(Qt.ItemDataRole.UserRole, novo_id)
             self._carregando = False
+            self._alteracoes_nao_salvas = False
             self.status_label.setStyleSheet("color: #2e7d32;")
             self.status_label.setText("✓ Salvo no Google Sheets com sucesso.")
         else:
@@ -959,7 +1041,7 @@ class ProductListPage(QWidget):
         if self._operacao_em_andamento:
             return
 
-        # 1) Mostra na hora o que já temos em cache local, sem esperar a rede.
+        # mostra o cache local na hora, sem esperar a rede
         dados_cache = cache_carregar(self.empresa["nome"])
         if dados_cache:
             self._linhas_por_produto = {}
@@ -973,7 +1055,7 @@ class ProductListPage(QWidget):
             self.dica_label.setStyleSheet("color: #999;")
             self.dica_label.setText("Carregando produtos do Google Sheets...")
 
-        # 2) Em paralelo, busca a versão atual no Sheets pra confirmar/atualizar.
+        # busca a versão atual em paralelo, pra confirmar/atualizar
         self._definir_ocupado(True)
 
         self._geracao_carregamento = getattr(self, "_geracao_carregamento", 0) + 1
@@ -983,8 +1065,7 @@ class ProductListPage(QWidget):
         self._worker.concluido.connect(self._on_carregamento_concluido)
         self._worker.start()
 
-        # Watchdog: se em 45s não vier resposta (nem sucesso nem erro), sai
-        # do estado "Carregando..." em vez de travar pra sempre.
+        # watchdog: sai do "Carregando..." se não vier resposta em 45s
         QTimer.singleShot(45000, lambda: self._verificar_timeout_carregamento(geracao_desta_chamada))
 
     def _verificar_timeout_carregamento(self, geracao_esperada: int):
@@ -1003,8 +1084,7 @@ class ProductListPage(QWidget):
             return  # o watchdog já assumiu o controle (resposta chegou tarde demais)
         self._definir_ocupado(False)
         if not sucesso:
-            # Se já tínhamos dados de cache na tela, mantemos eles visíveis e
-            # só avisamos que a atualização falhou — melhor que apagar tudo.
+            # mantém o cache visível e só avisa que a atualização falhou
             if self._linhas_por_produto:
                 self.dica_label.setStyleSheet("color: #c0392b;")
                 self.dica_label.setText(f"Não consegui atualizar do Sheets agora: {resultado}")
@@ -1021,8 +1101,7 @@ class ProductListPage(QWidget):
         for linha in resultado:
             self._linhas_por_produto.setdefault(linha["produto"], []).append(linha)
 
-        # produtos pendentes que já ganharam alguma compra salva deixam de
-        # ser "pendentes" — já vieram na busca acima
+        # produtos pendentes que já vieram na busca deixam de ser "pendentes"
         self._produtos_pendentes = [
             p for p in self._produtos_pendentes if p not in self._linhas_por_produto
         ]
@@ -1069,6 +1148,7 @@ class ProductListPage(QWidget):
 
         item_nome = QTableWidgetItem(nome_produto)
         item_nome.setFlags(item_nome.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        item_nome.setToolTip(nome_produto)  # nomes longos ficam visíveis ao passar o mouse
         item_data = QTableWidgetItem(data_txt)
         item_data.setFlags(item_data.flags() & ~Qt.ItemFlag.ItemIsEditable)
         item_data.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1106,8 +1186,9 @@ class ProductListPage(QWidget):
         self._reconstruir_tabela()
         self.status_label.setStyleSheet("color: #2e7d32;")
         self.status_label.setText(
-            f"'{nome}' criado. Abra a lista dele e salve pelo menos uma compra pra ele aparecer no Sheets."
+            f"'{nome}' criado. Salve pelo menos uma compra pra ele aparecer no Sheets."
         )
+        self._abrir_produto(nome)  # abre na hora, sem precisar procurar o item recém-criado na lista
 
     def _remover_produto(self):
         if self._operacao_em_andamento:
@@ -1251,16 +1332,14 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self._paginas_produtos[nome_empresa])
 
     def abrir_produto(self, empresa: dict, produto: str, linhas: list):
-        # Cada abertura cria uma página nova: os dados vêm sempre frescos da
-        # lista de produtos, que acabou de buscar no Sheets
+        # sempre cria uma página nova, com dados frescos vindos do Sheets
         pagina = ProductEntriesPage(
             empresa, produto, linhas,
             voltar_callback=lambda: self.voltar_para_lista_produtos(empresa),
         )
         if self._pagina_entradas_atual is not None:
-            # Avisa a página antiga que ela está de saída ANTES de destruí-la,
-            # pra qualquer worker de rede ainda em voo saber que deve ignorar
-            # o resultado em vez de tentar atualizar widgets já apagados.
+            # avisa a página antiga ANTES de destruí-la, pra um worker de
+            # rede atrasado saber que deve ignorar o resultado
             self._pagina_entradas_atual.marcar_destruida()
             self.stack.removeWidget(self._pagina_entradas_atual)
             self._pagina_entradas_atual.deleteLater()

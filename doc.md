@@ -7,6 +7,10 @@
 ![Arquitetura](https://img.shields.io/badge/Arquitetura-MVC%20simplificado-9b59b6)
 
 > **Changelog desta versão:** correção de um crash (`RuntimeError: wrapped C/C++ object ... has been deleted`) causado por respostas de rede chegando depois que uma tela já tinha sido fechada; cache local em disco para a lista de produtos aparecer instantaneamente; e otimizações no backend Apps Script (cache de leitura, escrita em lote, índice de IDs) para acelerar listas grandes. Tudo isso está documentado nas seções marcadas com 🆕.
+>
+> **Changelog de usabilidade (esta revisão):** navegação por Enter na tabela de compras (Data → Quantidade → Preço Unitário); produto novo nasce com 1 linha em branco (era 3) e já abre automaticamente ao ser criado; aviso de confirmação ao clicar em "← Voltar" havendo alterações não salvas; e nomes/títulos muito longos agora truncam com reticências (+ tooltip) em vez de desalinhar o layout. Marcado nas seções com 🆕².
+>
+> **Changelog de correção (pós-revisão):** a primeira versão da navegação por Enter e do rótulo elidível tinha dois bugs — o hint do Qt usado para detectar o Enter estava errado (e seu nome no PyQt6 varia por versão do binding), e o rótulo elidível calculava a largura de corte antes de estar no layout de verdade, então nunca truncava nada. Os dois foram corrigidos e confirmados com testes isolados. Marcado nas seções com 🆕³.
 
 ---
 
@@ -82,12 +86,12 @@ BORDA_ESPESSURA = 3
 COLUNAS_ENTRADAS = ["Data", "Quantidade", "Preço Unitário", "Preço Total"]
 COL_DATA, COL_QTD, COL_PRECO_UNIT, COL_TOTAL = range(4)
 
-ROWS_INICIAIS = 3
+ROWS_INICIAIS = 1
 ```
 
 - `BORDA_COR`/`BORDA_ESPESSURA` são usadas ao desenhar as logos circulares.
 - `COLUNAS_ENTRADAS` define os títulos das colunas da tabela de compras, e as constantes `COL_DATA`, `COL_QTD`, `COL_PRECO_UNIT`, `COL_TOTAL` (0, 1, 2, 3) evitam usar números "mágicos" espalhados pelo código — em vez de `tabela.item(row, 2)`, o código usa `tabela.item(row, COL_PRECO_UNIT)`, o que é bem mais legível.
-- `ROWS_INICIAIS = 3` é quantas linhas em branco aparecem quando o usuário abre um produto que ainda não tem nenhuma compra registrada.
+- `ROWS_INICIAIS` é quantas linhas em branco aparecem quando o usuário abre um produto que ainda não tem nenhuma compra registrada. 🆕² Era `3`; passou a ser `1` — o usuário pediu menos ruído visual ao criar um produto novo, e usa "+ Adicionar linha" se precisar de mais.
 
 ---
 
@@ -384,6 +388,69 @@ Um widget pequeno (230x84px) que desenha, à mão, um gráfico de linha simplifi
 
 Esse widget é usado dentro da tela de compras (`ProductEntriesPage`), alimentado com os preços unitários ordenados por data.
 
+### Rótulo elidível (`LabelElidavel`) 🆕²
+
+```python
+class LabelElidavel(QLabel):
+    def setText(self, texto: str):
+        self._texto_completo = texto
+        self.setToolTip(texto)
+        super().setText(texto)
+        self._reelidir()
+
+    def minimumSizeHint(self):
+        largura_minima = self.fontMetrics().horizontalAdvance("...")
+        return QSize(largura_minima, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reelidir()
+
+    def _reelidir(self):
+        texto_elidido = self.fontMetrics().elidedText(
+            self._texto_completo, Qt.TextElideMode.ElideRight, self.width()
+        )
+        super().setText(texto_elidido)
+```
+
+Resolve o problema de nomes de produto muito grandes desalinhando a tela: em vez de um `QLabel` comum (que cresce sem limite e empurra o resto do layout), esse `QLabel` guarda o texto completo internamente (`_texto_completo`) e, toda vez que é redesenhado ou redimensionado, calcula — via `QFontMetrics.elidedText` — a versão truncada com reticências (`"Empresa › Nome de produto gigan…"`) que cabe na largura atual do widget. O texto original nunca é perdido: fica sempre disponível como tooltip ao passar o mouse por cima. É usado no título "Empresa › Produto" da tela de compras (`ProductEntriesPage`, ver [Seção 8](#8-página-3--compras-de-um-produto-producteentriespage)), que antes era um `QLabel` normal.
+
+🆕³ **Bug da primeira versão, e por que `minimumSizeHint()` precisou ser sobrescrito:** só truncar no `resizeEvent` não bastava. Por padrão, o `minimumSizeHint()` de um `QLabel` acompanha o **texto atual** do label. No instante em que o `LabelElidavel` é construído, ele ainda não tem pai nem está dentro de nenhum layout — nesse momento, `self.width()` reflete o tamanho padrão de uma janela solta (bem maior que o espaço real disponível depois), então a primeira tentativa de eliminar não corta nada, e o texto completo (grande) fica gravado como o texto "oficial" do label. A partir daí, o `minimumSizeHint()` do Qt reporta esse texto grande como o tamanho mínimo — e o layout, por definição, nunca entrega a um widget menos espaço do que o mínimo dele. Resultado: o `resizeEvent` nunca chega a ser chamado com uma largura pequena o bastante pra truncar de verdade, e a tela volta a ficar torta. A correção foi sobrescrever `minimumSizeHint()` para **nunca** depender do texto atual — ele sempre devolve só a largura de `"..."`, liberando o layout para espremer esse rótulo à vontade. É esse espremer que dispara o `resizeEvent` com a largura real disponível, e só aí a elisão de fato acontece.
+
+### Tabela com navegação por Enter (`TabelaComNavegacaoEnter`) 🆕²
+
+```python
+class TabelaComNavegacaoEnter(QTableWidget):
+    _HINT_ENTER = getattr(
+        QAbstractItemDelegate.EndEditHint, "SubmitModelData", None
+    ) or QAbstractItemDelegate.EndEditHint.SubmitModelCache
+
+    def closeEditor(self, editor, hint):
+        if hint != self._HINT_ENTER:
+            super().closeEditor(editor, hint)
+            return
+
+        row, col = self.currentRow(), self.currentColumn()
+        super().closeEditor(editor, QAbstractItemDelegate.EndEditHint.NoHint)
+
+        proxima_coluna = {COL_DATA: COL_QTD, COL_QTD: COL_PRECO_UNIT}.get(col)
+        if proxima_coluna is None:
+            return
+
+        self.setCurrentCell(row, proxima_coluna)
+        self.editItem(self.item(row, proxima_coluna))
+```
+
+Ao confirmar uma célula em edição, o Qt avisa a view **qual tecla motivou o fechamento** através de um "hint" entregue ao método `closeEditor`. Essa subclasse intercepta esse hint especificamente quando ele indica que foi o **Enter/Return** que fechou o editor: em vez de deixar o comportamento padrão (que apenas confirma o valor, sem mover o cursor), ela fecha o editor manualmente (`NoHint`) e decide o próximo passo, seguindo o fluxo de preenchimento de uma compra:
+
+- Na coluna **Data**, Enter abre a edição da célula **Quantidade** da mesma linha.
+- Na coluna **Quantidade**, Enter abre a edição da célula **Preço Unitário** da mesma linha.
+- Na coluna **Preço Unitário**, o dicionário `proxima_coluna` não tem uma entrada correspondente (`.get()` devolve `None`), então a função simplesmente retorna — o valor já foi confirmado, mas o cursor **não avança e nenhuma linha nova é criada**. (A coluna Total nunca entra nesse fluxo por ser somente leitura.)
+
+Essa classe substitui o `QTableWidget` usado na tabela de compras (`self.tabela`, dentro de `ProductEntriesPage._montar_ui`, ver [Seção 8](#8-página-3--compras-de-um-produto-producteentriespage)).
+
+🆕³ **Bug da primeira versão, e o porquê do `_HINT_ENTER`:** a primeira tentativa comparava o hint recebido com `QAbstractItemDelegate.EndEditHint.EditNextItem` (o hint oficialmente documentado para a tecla Tab) — mas testando na prática, o hint que o Enter realmente dispara é outro. Pior: o *nome* desse hint na enumeração do Python varia por versão do binding PyQt6 — na documentação oficial (e em versões mais novas do PyQt6) ele se chama `SubmitModelData`, mas em versões mais antigas existe um erro de digitação conhecido no binding, e o mesmo hint aparece com o nome `SubmitModelCache`. Como `if hint != EditNextItem` nunca era verdadeiro pro Enter, o código simplesmente caía no comportamento padrão do Qt (nada acontecia) — daí o Enter "não fazer nada" ao ser apertado na coluna Data. A correção usa `getattr(..., "SubmitModelData", None) or ...SubmitModelCache` para resolver o hint certo em tempo de importação, tentando primeiro o nome oficial e caindo para o nome com erro de digitação se o oficial não existir nessa instalação — funcionando nas duas versões do binding.
+
 ---
 
 ## 8. Página 3 — Compras de um produto (`ProductEntriesPage`)
@@ -400,6 +467,7 @@ self.voltar_callback = voltar_callback
 self._carregando = False           # evita reagir a mudanças feitas pelo próprio código
 self._operacao_em_andamento = False  # bloqueia botões durante chamadas de rede
 self._worker = None
+self._alteracoes_nao_salvas = False  # 🆕² ver "Sair sem salvar", abaixo
 self._destruida = False            # 🆕 ver abaixo
 ```
 
@@ -440,9 +508,9 @@ def _definir_ocupado(self, ocupado: bool, mensagem: str = ""):
 ### Montagem da UI (`_montar_ui`)
 
 Monta, de cima para baixo:
-1. **Linha de título** (`_criar_linha_titulo`) — botão "Voltar" (agora guardado como `self.btn_voltar` 🆕, em vez de variável local, justamente para poder ser desabilitado por `_definir_ocupado`), indicadores de melhor/pior compra, o mini gráfico, e o nome "Empresa › Produto" centralizado. Um `QLabel` vazio à direita (`espacador`) equilibra visualmente o bloco da esquerda, mantendo o título realmente centralizado.
+1. **Linha de título** (`_criar_linha_titulo`) — botão "Voltar" (guardado como `self.btn_voltar` 🆕, em vez de variável local, para poder ser desabilitado por `_definir_ocupado`; 🆕² agora chama `_tentar_voltar` em vez do `voltar_callback` direto, ver abaixo), indicadores de melhor/pior compra, o mini gráfico, e o título "Empresa › Produto" centralizado — 🆕² agora um `LabelElidavel` em vez de `QLabel` comum, pra não desalinhar a tela quando o nome do produto é muito grande (ver [Seção 7](#7-mini-gráfico-de-tendência-de-preço)). Um `QLabel` vazio à direita (`espacador`) equilibra visualmente o bloco da esquerda, mantendo o título realmente centralizado.
 2. **Linha de filtro por data** (`_criar_linha_filtro`) — dois `QDateEdit` ("De" / "Até") e os botões "Filtrar" / "Limpar filtro".
-3. **A tabela de compras** — 4 colunas (`COLUNAS_ENTRADAS`), com o cabeçalho pintado na cor da empresa. Ela escuta `itemChanged` (`self.tabela.itemChanged.connect(self._on_item_changed)`).
+3. **A tabela de compras** — 🆕² agora uma `TabelaComNavegacaoEnter` (ver [Seção 7](#7-mini-gráfico-de-tendência-de-preço)) em vez de `QTableWidget` puro, com 4 colunas (`COLUNAS_ENTRADAS`) e cabeçalho pintado na cor da empresa. Ela escuta `itemChanged` (`self.tabela.itemChanged.connect(self._on_item_changed)`).
 4. **Label de total do produto**.
 5. **Linha de botões** (`_criar_linha_botoes`) — Adicionar linha / Remover linha / Recarregar do Sheets / Salvar.
 6. **Label de status**, que mostra mensagens de sucesso (verde) ou erro (vermelho) das operações.
@@ -477,6 +545,23 @@ Esse é o "motor" reativo da tela:
 ### Filtro por data (`_aplicar_filtro_data` / `_limpar_filtro_data`)
 
 `_aplicar_filtro_data` lê as duas datas escolhidas (`De`/`Até`), valida que "De" não é depois de "Até", e esconde (`setRowHidden`) toda linha cuja data esteja fora do intervalo (ou que tenha uma data inválida). Depois recalcula os indicadores, já que eles ignoram linhas escondidas. `_limpar_filtro_data` reexibe todas as linhas e reseta os campos de data.
+
+### 🆕² Sair sem salvar (`_tentar_voltar`)
+
+```python
+def _tentar_voltar(self):
+    if self._alteracoes_nao_salvas:
+        resposta = QMessageBox.question(
+            self, "Sair sem salvar",
+            "Você tem alterações que ainda não foram salvas. Quer sair mesmo assim?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if resposta != QMessageBox.StandardButton.Yes:
+            return
+    self.voltar_callback()
+```
+
+O botão "← Voltar" não chama mais `voltar_callback` diretamente — ele passou a chamar `_tentar_voltar`, que primeiro confere a flag `self._alteracoes_nao_salvas`. Essa flag é ligada dentro de `_on_item_changed` sempre que o **usuário** edita uma célula (linha nova preenchida ou edição numa linha já existente — preencher a tabela programaticamente, com `_carregando` ativo, nunca liga essa flag). Ela é desligada em dois momentos: logo após `_popular_tabela` terminar de (re)carregar os dados (não há nada "novo" a perder ainda) e logo após um salvamento bem-sucedido em `_on_salvamento_concluido`. Se existir alguma alteração pendente, um `QMessageBox.question` pede confirmação antes de voltar; se o usuário escolher "Não", a navegação é cancelada e ele continua na tela de compras.
 
 ### Salvar (`_salvar` → `_on_salvamento_concluido`)
 
@@ -575,11 +660,11 @@ Junta produtos "reais" (do Sheets) com produtos "pendentes" (criados nesta sess�
 
 ### Cada linha da tabela (`_inserir_linha_produto`)
 
-Para cada produto, busca a última compra com `obter_ultima_compra` e mostra sua data e valor. A célula na última coluna não é um texto — é um **botão** (`QPushButton("Abrir lista →")`) inserido com `setCellWidget`, que ao ser clicado chama `_abrir_produto(nome_produto)`. Um duplo clique em qualquer célula da linha também abre o produto (via `itemDoubleClicked`).
+Para cada produto, busca a última compra com `obter_ultima_compra` e mostra sua data e valor. A célula na última coluna não é um texto — é um **botão** (`QPushButton("Abrir lista →")`) inserido com `setCellWidget`, que ao ser clicado chama `_abrir_produto(nome_produto)`. Um duplo clique em qualquer célula da linha também abre o produto (via `itemDoubleClicked`). 🆕² A célula com o nome do produto (`item_nome`) agora também recebe um `setToolTip(nome_produto)`, mostrando o nome completo ao passar o mouse quando ele é grande demais para a coluna.
 
 ### Adicionar e remover produtos
 
-- **`_adicionar_produto`**: abre um `QInputDialog` pedindo o nome, valida que não é vazio nem duplicado, e adiciona à lista `_produtos_pendentes`.
+- **`_adicionar_produto`**: abre um `QInputDialog` pedindo o nome, valida que não é vazio nem duplicado, e adiciona à lista `_produtos_pendentes`. 🆕² Em seguida chama `self._abrir_produto(nome)` — o produto recém-criado é aberto na hora, direto na tela de compras, sem o usuário precisar localizá-lo na lista (que pode estar ordenada ou filtrada de um jeito que o esconda).
 - **`_remover_produto`**: se o produto **não tem nenhum ID** (é só "pendente", nunca foi salvo), remove localmente sem chamar o Sheets. Se **tem IDs**, pede confirmação e dispara `sheets_remover` com a lista de todos os IDs daquele produto de uma vez (remove todas as compras do produto na mesma chamada).
 
 ---
@@ -853,3 +938,8 @@ Por fim, `doPost` chama `invalidarCache()` depois de qualquer `salvar` ou `remov
 | 🆕 **Cache local (Python)** | Arquivo `.json` por empresa, em `cache/`, usado para popular a tela instantaneamente antes da resposta real do Sheets chegar |
 | 🆕 **`CacheService` (Apps Script)** | Cache temporário do lado do Google, usado para não reler a planilha inteira a cada `GET`, respeitando o limite de 100KB por chave via divisão em pedaços |
 | 🆕 **Índice de IDs** | Mapa `{id: linha}` construído uma única vez por requisição de escrita, evitando releituras repetidas da coluna de IDs |
+| 🆕² **`LabelElidavel`** | `QLabel` que trunca o próprio texto com reticências quando não cabe na largura disponível, mantendo o texto completo como tooltip |
+| 🆕² **`TabelaComNavegacaoEnter`** | `QTableWidget` da tela de compras cujo Enter avança Data → Quantidade → Preço Unitário em vez de descer de linha, e não avança nem cria linha nova a partir de Preço Unitário |
+| 🆕² **`_alteracoes_nao_salvas`** | Flag na `ProductEntriesPage` que rastreia edições ainda não enviadas ao Sheets, usada por `_tentar_voltar` para confirmar antes de sair da tela |
+| 🆕³ **`minimumSizeHint()`** | Método do Qt que informa ao layout o menor tamanho aceitável de um widget; sobrescrito em `LabelElidavel` pra não crescer junto com o texto, permitindo a elisão de verdade |
+| 🆕³ **Hint de `closeEditor`** | Sinal que o Qt manda pra view avisando qual tecla fechou o editor de uma célula; o do Enter tem o nome oficial `SubmitModelData`, mas aparece como `SubmitModelCache` em algumas versões do PyQt6 |

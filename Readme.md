@@ -24,6 +24,13 @@ Toda alteração (adicionar, editar ou remover uma linha) é enviada em tempo re
 | Adicionar / editar e salvar | `POST` (`acao: "salvar"`) | Grava linhas novas em lote e atualiza as existentes |
 | Remover linha ou produto | `POST` (`acao: "remover"`) | Apaga a linha de verdade, sem deixar espaço em branco |
 
+## Usabilidade da tela de compras
+
+- **Preenchimento rápido com Enter:** ao digitar a Data e apertar Enter, o foco pula direto para Quantidade e, de lá, para Preço Unitário — sem precisar clicar em cada campo. Em Preço Unitário o Enter só confirma o valor e para ali (não cria uma linha nova).
+- **Produto novo começa enxuto:** um produto sem nenhuma compra ainda abre com só 1 linha em branco (em vez de 3) e já é aberto automaticamente assim que criado, sem precisar procurá-lo na lista.
+- **Aviso ao sair sem salvar:** se você editou algo na tabela de compras e clicar em "← Voltar" sem ter salvado, o app pede confirmação antes de descartar as alterações.
+- **Nomes longos não quebram mais a tela:** títulos e nomes de produto muito grandes são truncados com "..." em vez de desalinhar o layout — passe o mouse por cima para ver o nome completo.
+
 ## Desempenho e confiabilidade
 
 - **Cache local (Python):** ao abrir uma empresa, o app mostra na hora os últimos dados salvos em `cache/`, enquanto busca a versão atual do Sheets em segundo plano — sem precisar esperar a rede pra ver algo na tela.
@@ -54,7 +61,7 @@ O arquivo principal é organizado em blocos:
 3. Integração com o Google Sheets (`sheets_buscar`, `sheets_salvar`, `sheets_remover`)
 4. Cache local em disco (`cache_carregar`, `cache_salvar`)
 5. Avatares circulares das empresas
-6. Mini gráfico de tendência de preço
+6. Mini gráfico de tendência de preço, rótulo elidível (`LabelElidavel`) e tabela com navegação por Enter (`TabelaComNavegacaoEnter`)
 7. Página de compras de um produto
 8. Página de lista de produtos de uma empresa
 9. Página de seleção de empresa
