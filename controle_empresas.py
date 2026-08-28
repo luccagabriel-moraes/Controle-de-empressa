@@ -1,21 +1,25 @@
 import sys
 import os
+import re
 import json
 import uuid
+import base64
+import unicodedata
 import urllib.request
 import urllib.error
 import urllib.parse
+from html import unescape
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QAbstractItemView, QDateEdit, QInputDialog, QLineEdit,
-    QAbstractItemDelegate
+    QAbstractItemDelegate, QFileDialog, QComboBox, QScrollArea,
+    QDialog, QFormLayout, QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QDate, QSize, QRectF, QPointF, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont, QColor, QPixmap, QPainter, QPainterPath, QPen, QLinearGradient
-
+from PyQt6.QtGui import QFont, QColor, QPixmap, QPainter, QPainterPath, QPen, QLinearGradient, QPalette
 
 # --------------------------------------------------------------------------- #
 # Configuração
@@ -25,8 +29,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 
-# URL do Web App do Google Apps Script (termina em "/exec").
-GOOGLE_SHEETS_WEBHOOK_URL = ""
+# A URL do Web App do Apps Script (termina em "/exec") NÃO fica no código: quem
+# tem essa URL lê e escreve na planilha inteira, então ela é um segredo e não
+# pode entrar no git. Ela vem da variável de ambiente GOOGLE_SHEETS_WEBHOOK_URL
+# ou do config.json (ver sheets_webhook_url()); o diálogo "⚙️ Configurar" grava.
+
+# Configuração pessoal do usuário (URL da planilha, chave da API de IA, modelo).
+# Fica fora da pasta do projeto e fora do git — guarda segredos. O diálogo
+# "⚙️ Configurar" (ConfigDialog) lê e grava esse arquivo.
+CONFIG_DIR = os.path.expanduser("~/.config/controle_empresas")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+# Modelo padrão pra ler as notas. Se um dia ele for desligado, a primeira
+# leitura que falhar com 404 dispara _ia_descobrir_modelo(), que acha um
+# Flash válido na conta e grava no config.json — o usuário nem percebe.
+MODELO_IA_PADRAO = "gemini-2.5-flash"
 
 # nome, cor de destaque, cor do texto sobre essa cor e o caminho da logo (None = ícone/texto)
 COMPANIES = [
@@ -56,8 +73,8 @@ COMPANIES = [
 BORDA_COR = "#e8e8e8"
 BORDA_ESPESSURA = 3
 
-COLUNAS_ENTRADAS = ["Data", "Quantidade", "Preço Unitário", "Preço Total"]
-COL_DATA, COL_QTD, COL_PRECO_UNIT, COL_TOTAL = range(4)
+COLUNAS_ENTRADAS = ["Nome", "Data", "Quantidade", "Preço Unitário", "Preço Total"]
+COL_NOME, COL_DATA, COL_QTD, COL_PRECO_UNIT, COL_TOTAL = range(5)
 
 ROWS_INICIAIS = 1  # linhas em branco ao abrir um produto novo/sem registros
 
@@ -85,6 +102,432 @@ def parse_numero(texto: str) -> float:
 
 def gerar_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+# --------------------------------------------------------------------------- #
+# Configuração pessoal em disco (chave da API de IA, modelo escolhido)
+# --------------------------------------------------------------------------- #
+
+def carregar_config() -> dict:
+    """Lê ~/.config/controle_empresas/config.json. Devolve {} se não existir
+    ou estiver corrompido — o app funciona sem ele, só o botão de importar
+    nota fiscal fica indisponível até a chave ser configurada."""
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+        return dados if isinstance(dados, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def salvar_config(dados: dict) -> None:
+    """Grava a configuração com permissão 600 (só o dono lê) — a chave da API
+    é um segredo e não deve ficar legível pra outros usuários da máquina."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as arquivo:
+        json.dump(dados, arquivo, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass  # sistemas de arquivos sem permissões POSIX (ex: pen drive) — segue sem
+
+
+def sheets_webhook_url() -> str:
+    """A URL do Web App do Apps Script, da variável de ambiente
+    GOOGLE_SHEETS_WEBHOOK_URL (tem prioridade) ou do config.json. É um segredo:
+    quem tem a URL lê e escreve na planilha inteira — por isso não fica no
+    código. Devolve "" se ainda não foi configurada."""
+    return (os.environ.get("GOOGLE_SHEETS_WEBHOOK_URL")
+            or carregar_config().get("sheets_webhook_url") or "").strip()
+
+
+def ia_api_key() -> str:
+    """A chave da API do Gemini, da variável de ambiente GEMINI_API_KEY
+    (tem prioridade) ou do config.json."""
+    return (os.environ.get("GEMINI_API_KEY") or carregar_config().get("gemini_api_key") or "").strip()
+
+
+def ia_modelo() -> str:
+    return (carregar_config().get("gemini_modelo") or "").strip() or MODELO_IA_PADRAO
+
+
+# --------------------------------------------------------------------------- #
+# Importar compra a partir de foto de nota fiscal (IA de visão — Google Gemini)
+# --------------------------------------------------------------------------- #
+# A foto é enviada direto pra API do Gemini, que devolve os itens já
+# estruturados (nome, data, quantidade, preço unitário). Não há OCR local:
+# o modelo lê a imagem inteira, entende o layout da nota e separa os itens
+# de linhas de total/imposto/estabelecimento sozinho. A tela de conferência
+# (ImportarNotaFiscalPage) continua obrigatória — nada vai pro Sheets sem o
+# usuário revisar.
+
+class ErroIA(Exception):
+    """Falha ao ler a nota com a IA: chave ausente/recusada, rede fora,
+    modelo inexistente, limite de uso atingido ou resposta inesperada."""
+
+
+_IA_URL_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+
+_IA_LIMITE_IMAGEM = 18 * 1024 * 1024  # a API aceita ~20 MB por requisição, contando o base64
+
+_IA_REGRAS_ITENS = (
+    "Extraia CADA produto comprado. Para cada item devolva:\n"
+    "- nome: a descrição do produto como aparece na nota (marca/embalagem), sem códigos numéricos;\n"
+    "- data: a data da compra no formato dd/mm/aaaa (use a data da nota; se não houver, deixe vazio);\n"
+    "- quantidade: número decimal com ponto (se a nota não mostrar, use 1);\n"
+    "- preco_unitario: o preço de UMA unidade, em reais, como número decimal com ponto (ex: 12.90). "
+    "Se a nota só mostrar o total do item, divida o total pela quantidade.\n"
+    "Ignore linhas de total, subtotal, troco, desconto, acréscimo, tributos/impostos, "
+    "forma de pagamento e os dados do estabelecimento e do consumidor. "
+)
+
+_IA_PROMPT_NOTA = (
+    "Você recebe a foto de uma nota fiscal, cupom fiscal ou comprovante de compra brasileiro. "
+    + _IA_REGRAS_ITENS +
+    "Se a imagem não for uma nota/cupom legível, devolva a lista de itens vazia."
+)
+
+_IA_PROMPT_LINK = (
+    "O texto abaixo foi extraído da página oficial de consulta de uma nota fiscal eletrônica "
+    "brasileira (NFC-e / NF-e) no site da SEFAZ. "
+    + _IA_REGRAS_ITENS +
+    "Se o texto não contiver a lista de produtos de uma nota fiscal, devolva a lista de itens vazia.\n\n"
+    "TEXTO DA PÁGINA:\n"
+)
+
+_IA_SCHEMA_NOTA = {
+    "type": "object",
+    "properties": {
+        "itens": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "nome": {"type": "string"},
+                    "data": {"type": "string"},
+                    "quantidade": {"type": "number"},
+                    "preco_unitario": {"type": "number"},
+                },
+                "required": ["nome", "quantidade", "preco_unitario"],
+            },
+        }
+    },
+    "required": ["itens"],
+}
+
+_IA_MIMES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".bmp": "image/bmp", ".heic": "image/heic", ".heif": "image/heif",
+}
+
+
+def _ia_requisitar(url: str, dados: bytes = None, timeout: int = 90, api_key: str = None) -> dict:
+    """POST/GET na API do Gemini com tratamento de erro traduzido pro
+    usuário (ErroIA). Usado tanto pra ler a nota quanto pra listar modelos.
+    `api_key` permite testar uma chave ainda não salva (diálogo de config)."""
+    cabecalhos = {"x-goog-api-key": api_key or ia_api_key()}
+    if dados is not None:
+        cabecalhos["Content-Type"] = "application/json"
+    requisicao = urllib.request.Request(url, data=dados, headers=cabecalhos,
+                                        method="POST" if dados is not None else "GET")
+    try:
+        with urllib.request.urlopen(requisicao, timeout=timeout) as resposta:
+            return json.loads(resposta.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detalhe = ""
+        try:
+            detalhe = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+        except (ValueError, OSError):
+            pass
+        if e.code in (401, 403) or (e.code == 400 and "api key" in detalhe.lower()):
+            raise ErroIA(f"A chave da API foi recusada pelo Google (HTTP {e.code}). "
+                         f"Confira em '⚙️ Configurar'. {detalhe}".strip()) from e
+        if e.code == 404:
+            raise ErroIA(f"O modelo '{ia_modelo()}' não existe ou não está liberado pra sua chave. "
+                         f"Escolha outro em '⚙️ Configurar'. {detalhe}".strip()) from e
+        if e.code == 429:
+            raise ErroIA("Limite de uso da API do Gemini atingido. Espere alguns minutos e tente de novo.") from e
+        raise ErroIA(f"O Google respondeu com erro HTTP {e.code}. {detalhe}".strip()) from e
+    except urllib.error.URLError as e:
+        raise ErroIA(f"Não foi possível conectar à API do Gemini: {e.reason}") from e
+    except (OSError, ValueError) as e:
+        raise ErroIA(f"Falha ao falar com a API do Gemini: {e}") from e
+
+
+def ler_nota_fiscal_ia(caminho_imagem: str) -> list:
+    """Envia a foto pra API do Gemini e devolve a lista de itens reconhecidos
+    (dicts com nome/data/quantidade/preco_unitario). Levanta ErroIA em
+    qualquer falha. Função pura (sem Qt) — roda dentro de um SheetsWorker."""
+    if not ia_api_key():
+        raise ErroIA("Configure a chave da API do Google Gemini em '⚙️ Configurar' antes de importar uma nota.")
+
+    try:
+        with open(caminho_imagem, "rb") as arquivo:
+            imagem_bytes = arquivo.read()
+    except OSError as e:
+        raise ErroIA(f"Não consegui abrir a imagem: {e}") from e
+
+    if not imagem_bytes:
+        raise ErroIA("O arquivo de imagem está vazio.")
+    if len(imagem_bytes) > _IA_LIMITE_IMAGEM:
+        raise ErroIA("A imagem é grande demais (acima de ~18 MB). Tire a foto numa resolução menor.")
+
+    mime = _IA_MIMES.get(os.path.splitext(caminho_imagem)[1].lower(), "image/jpeg")
+    return _ia_gerar_itens([
+        {"inline_data": {"mime_type": mime, "data": base64.b64encode(imagem_bytes).decode("ascii")}},
+        {"text": _IA_PROMPT_NOTA},
+    ])
+
+
+def ler_nota_fiscal_link(url: str) -> list:
+    """Baixa a página oficial de consulta de uma NFC-e (o link do QR code) e
+    manda o texto pra IA extrair os itens. Dados oficiais e completos —
+    melhor que ler a foto. Levanta ErroIA em qualquer falha; função pura."""
+    if not ia_api_key():
+        raise ErroIA("Configure a chave da API do Google Gemini em '⚙️ Configurar' antes de importar uma nota.")
+
+    url = (url or "").strip()
+    if not re.match(r"https?://", url, re.IGNORECASE):
+        raise ErroIA("Cole o link completo do QR code da nota (deve começar com http:// ou https://).")
+
+    try:
+        requisicao = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+        })
+        with urllib.request.urlopen(requisicao, timeout=40) as resposta:
+            bruto = resposta.read(4 * 1024 * 1024)  # NFC-e é pequena; corta em 4 MB por segurança
+            charset = resposta.headers.get_content_charset() or "utf-8"
+    except urllib.error.HTTPError as e:
+        raise ErroIA(f"A página da nota respondeu com erro HTTP {e.code}. Confira se o link está completo e correto.") from e
+    except (urllib.error.URLError, OSError) as e:
+        motivo = getattr(e, "reason", e)
+        raise ErroIA(f"Não consegui abrir o link da nota: {motivo}") from e
+
+    texto = _texto_de_html(bruto.decode(charset, errors="replace"))
+    if len(texto) < 40:
+        raise ErroIA("A página do link veio vazia. O link pode ter expirado — abra o QR code de novo e copie o endereço atual.")
+
+    # alguns portais da SEFAZ (SC, por exemplo) protegem a consulta com um
+    # desafio de segurança/CAPTCHA em JavaScript — um fetch simples só vê a
+    # tela do desafio, nunca a nota. Detecta isso e orienta a usar a foto.
+    if len(texto) < 3000 and re.search(
+        r"valida[çc][ãa]o de seguran[çc]a|verifica[çc][ãa]o para prosseguimento|captcha|"
+        r"n[ãa]o sou um rob[ôo]|habilite o javascript|enable javascript",
+        texto, re.IGNORECASE,
+    ):
+        raise ErroIA(
+            "O site da SEFAZ desse estado exige uma verificação de segurança (CAPTCHA) que "
+            "o app não consegue passar. Use o botão '📷 Importar nota fiscal' com uma foto da nota."
+        )
+
+    if len(texto) > 60000:
+        texto = texto[:60000]
+
+    return _ia_gerar_itens([{"text": _IA_PROMPT_LINK + texto}])
+
+
+def _texto_de_html(html: str) -> str:
+    """Tira scripts, estilos e tags de um HTML, deixando só o texto visível —
+    o suficiente pra IA achar a tabela de itens da nota sem gastar tokens à
+    toa com marcação."""
+    html = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html)
+    html = re.sub(r"(?s)<[^>]+>", " ", html)
+    html = unescape(html).replace("\xa0", " ")
+    html = re.sub(r"[ \t\r\f\v]+", " ", html)
+    return re.sub(r"\n[ \n]*\n+", "\n", html).strip()
+
+
+def _ia_gerar_itens(parts: list) -> list:
+    """Manda os `parts` (imagem+texto, ou só texto) pro modelo e devolve a
+    lista de itens. Se o modelo configurado sumiu (404), acha outro Flash
+    válido, grava no config e tenta de novo — uma vez só."""
+    corpo = json.dumps({
+        "contents": [{"parts": parts}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": _IA_SCHEMA_NOTA,
+            "temperature": 0,
+        },
+    }).encode("utf-8")
+
+    try:
+        dados = _ia_requisitar(f"{_IA_URL_BASE}/{ia_modelo()}:generateContent", dados=corpo)
+    except ErroIA as erro_modelo:
+        # só troca de modelo se o erro foi especificamente "modelo não existe /
+        # não liberado" (404). Rede fora, limite de uso (429) ou falha do
+        # servidor não são problema de modelo — e _ia_descobrir_modelo()
+        # sobrescreveria a escolha do usuário no config.json à toa.
+        if "não existe" not in str(erro_modelo):
+            raise
+        modelo_novo = _ia_descobrir_modelo()
+        if not modelo_novo:
+            raise
+        dados = _ia_requisitar(f"{_IA_URL_BASE}/{modelo_novo}:generateContent", dados=corpo)
+
+    return _ia_itens_da_resposta(dados)
+
+
+def _ia_descobrir_modelo() -> str:
+    """Escolhe automaticamente um modelo Flash válido na conta e grava no
+    config.json — chamado quando o modelo atual dá 404 (foi desligado ou o
+    padrão embutido ficou velho). Devolve "" se a listagem também falhar."""
+    try:
+        nomes = listar_modelos_ia()
+    except ErroIA:
+        return ""
+    escolhido = next(
+        (n for n in nomes if "flash" in n and "lite" not in n and "image" not in n and "thinking" not in n),
+        next((n for n in nomes if "flash" in n), nomes[0] if nomes else ""),
+    )
+    if escolhido:
+        config = carregar_config()
+        config["gemini_modelo"] = escolhido
+        try:
+            salvar_config(config)
+        except OSError:
+            pass
+    return escolhido
+
+
+def _ia_itens_da_resposta(dados: dict) -> list:
+    candidatos = dados.get("candidates") or []
+    if not candidatos:
+        motivo = (dados.get("promptFeedback") or {}).get("blockReason")
+        raise ErroIA("A IA não retornou nenhum resultado"
+                     + (f" (conteúdo bloqueado: {motivo})." if motivo else "."))
+
+    partes = (candidatos[0].get("content") or {}).get("parts") or []
+    texto = "".join(parte.get("text", "") for parte in partes).strip()
+    if not texto:
+        if candidatos[0].get("finishReason") == "MAX_TOKENS":
+            raise ErroIA("A nota tem itens demais pra uma leitura só. Fotografe em partes.")
+        raise ErroIA("A IA respondeu em branco. Tente uma foto mais nítida.")
+
+    try:
+        conteudo = json.loads(texto)
+    except ValueError as e:
+        raise ErroIA(f"A IA não devolveu um JSON válido. Início da resposta: {texto[:200]}") from e
+
+    brutos = conteudo.get("itens") if isinstance(conteudo, dict) else conteudo
+    itens = []
+    for bruto in brutos or []:
+        if not isinstance(bruto, dict):
+            continue
+        nome = str(bruto.get("nome", "")).strip()
+        if not nome:
+            continue
+        itens.append({
+            "nome": _nome_apresentavel(nome),
+            "data": _ia_normalizar_data(str(bruto.get("data", "")).strip()),
+            "quantidade": _ia_para_numero(bruto.get("quantidade"), 1),
+            "preco_unitario": _ia_para_numero(bruto.get("preco_unitario"), 0),
+        })
+    return _consolidar_itens_iguais(itens)
+
+
+def _consolidar_itens_iguais(itens: list) -> list:
+    """Junta, numa linha só, itens da MESMA nota com o mesmo nome, o mesmo
+    preço unitário e a mesma data — somando a quantidade. Serve pra produtos
+    vendidos por peso (verduras, carnes): a nota lista uma linha por pesagem
+    ('4 brócolis, 5 repolhos'), mas como o preço do quilo é o mesmo em todas,
+    o que interessa é uma linha com o peso total."""
+    agrupados, ordem = {}, []
+    for item in itens:
+        chave = (
+            re.sub(r"\s+", " ", item["nome"].strip().lower()),
+            round(item["preco_unitario"], 2),
+            item["data"],
+        )
+        if chave in agrupados:
+            agrupados[chave]["quantidade"] = round(
+                agrupados[chave]["quantidade"] + item["quantidade"], 3
+            )
+        else:
+            agrupados[chave] = dict(item)
+            ordem.append(chave)
+    return [agrupados[chave] for chave in ordem]
+
+
+def _nome_apresentavel(texto: str) -> str:
+    """Padroniza o nome lido da nota como frase: só a primeira letra maiúscula
+    e todo o resto minúsculo ('ARROZ TIPO 1 5KG' -> 'Arroz tipo 1 5kg',
+    'Arroz Branco Tio João 5kg' -> 'Arroz branco tio joão 5kg').
+
+    A nota quase sempre vem em CAIXA ALTA e a IA às vezes devolve em Title
+    Case; o app grava sempre nesse formato pra a lista ficar uniforme. O
+    efeito colateral é que marcas com maiúscula interna ('Coca-Cola',
+    'iPhone') também são rebaixadas — se algum dia isso incomodar, dá pra
+    manter uma lista de exceções aqui."""
+    return re.sub(r"\s+", " ", texto).strip().capitalize()
+
+
+def _ia_para_numero(valor, padrao):
+    try:
+        numero = float(str(valor).replace(",", "."))
+        return numero if numero > 0 else padrao
+    except (TypeError, ValueError):
+        return padrao
+
+
+def _ia_normalizar_data(texto: str) -> str:
+    """Aceita dd/mm/aaaa, aaaa-mm-dd ou dd/mm/aa e devolve sempre dd/mm/aaaa
+    (formato que o resto do app usa). Devolve "" se não reconhecer."""
+    if not texto:
+        return ""
+    m = re.match(r"^\s*(\d{4})-(\d{1,2})-(\d{1,2})", texto)
+    if m:
+        ano, mes, dia = m.groups()
+        return f"{int(dia):02d}/{int(mes):02d}/{ano}"
+    m = re.match(r"^\s*(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})", texto)
+    if m:
+        dia, mes, ano = m.groups()
+        if len(ano) == 2:
+            ano = "20" + ano
+        return f"{int(dia):02d}/{int(mes):02d}/{ano}"
+    return ""
+
+
+def listar_modelos_ia(api_key: str = None) -> list:
+    """Nomes dos modelos da conta que aceitam generateContent (pra popular o
+    seletor no diálogo de configuração). Já vem sem o prefixo 'models/'."""
+    dados = _ia_requisitar(f"{_IA_URL_BASE}?pageSize=200", timeout=30, api_key=api_key)
+    nomes = []
+    for modelo in dados.get("models", []):
+        if "generateContent" in (modelo.get("supportedGenerationMethods") or []):
+            nomes.append(modelo.get("name", "").removeprefix("models/"))
+    return sorted(n for n in nomes if n)
+
+
+def _palavras_para_comparacao(texto: str) -> set:
+    """Reduz um texto a um conjunto de palavras minúsculas sem acento, pra
+    comparar nomes parecidos (ex: sugerir a pasta certa ao importar foto)."""
+    texto = unicodedata.normalize("NFKD", texto.lower()).encode("ascii", "ignore").decode("ascii")
+    return set(re.findall(r"[a-z0-9]+", texto))
+
+
+def sugerir_pasta(nome_lido: str, pastas_existentes: list):
+    """Sugere qual pasta (produto) já cadastrada mais se parece com o nome
+    lido na nota, comparando palavras em comum — ex: 'Aveia Flocos Marca X'
+    sugere a pasta 'Aveia Flocos' se ela existir, mas não confunde com
+    'Aveia Grão'. Devolve None se nenhuma pasta bater o suficiente (nesse
+    caso quem chamou oferece criar uma pasta nova)."""
+    palavras_nota = _palavras_para_comparacao(nome_lido)
+    if not palavras_nota:
+        return None
+
+    melhor_pasta, melhor_pontuacao = None, 0.0
+    for pasta in pastas_existentes:
+        palavras_pasta = _palavras_para_comparacao(pasta)
+        if not palavras_pasta:
+            continue
+        # pontuação = fração das palavras DA PASTA presentes na nota — assim
+        # a nota cobre 100% de "aveia flocos" mas só ~50% de "aveia grão"
+        pontuacao = len(palavras_nota & palavras_pasta) / len(palavras_pasta)
+        if pontuacao > melhor_pontuacao:
+            melhor_pasta, melhor_pontuacao = pasta, pontuacao
+
+    return melhor_pasta if melhor_pontuacao >= 0.6 else None
 
 
 def normalizar_data_sheets(valor) -> str:
@@ -161,8 +604,11 @@ class ErroSheets(Exception):
 
 
 def _requisitar(url: str, dados: bytes = None, metodo: str = "GET", timeout: int = 20) -> dict:
-    if not GOOGLE_SHEETS_WEBHOOK_URL:
-        raise ErroSheets("A URL do Google Sheets não foi configurada (GOOGLE_SHEETS_WEBHOOK_URL).")
+    if not url:
+        raise ErroSheets(
+            "A URL da planilha não foi configurada. Abra '⚙️ Configurar' e cole a URL do "
+            "Web App do Apps Script, ou defina a variável de ambiente GOOGLE_SHEETS_WEBHOOK_URL."
+        )
     try:
         requisicao = urllib.request.Request(
             url, data=dados,
@@ -193,8 +639,8 @@ def _requisitar(url: str, dados: bytes = None, metodo: str = "GET", timeout: int
 
 
 def sheets_buscar(empresa: str = None) -> list:
-    url = GOOGLE_SHEETS_WEBHOOK_URL
-    if empresa:
+    url = sheets_webhook_url()
+    if empresa and url:
         url += "?" + urllib.parse.urlencode({"empresa": empresa})
     corpo = _requisitar(url, metodo="GET", timeout=40)
     linhas = corpo.get("linhas", [])
@@ -210,18 +656,28 @@ def sheets_salvar(novas: list, existentes: list) -> list:
     (linha apagada por fora, por exemplo) — essas edições não foram salvas,
     mesmo a requisição como um todo tendo dado certo."""
     payload = json.dumps({"acao": "salvar", "novas": novas, "existentes": existentes}).encode("utf-8")
-    corpo = _requisitar(GOOGLE_SHEETS_WEBHOOK_URL, dados=payload, metodo="POST")
+    corpo = _requisitar(sheets_webhook_url(), dados=payload, metodo="POST")
     return corpo.get("idsNaoEncontrados", [])
 
 
 def sheets_remover(ids: list) -> None:
     payload = json.dumps({"acao": "remover", "ids": ids}).encode("utf-8")
-    _requisitar(GOOGLE_SHEETS_WEBHOOK_URL, dados=payload, metodo="POST")
+    _requisitar(sheets_webhook_url(), dados=payload, metodo="POST")
+
+
+def sheets_renomear_produtos(itens: list) -> list:
+    """Renomeia produto (pasta) e/ou nome de linhas já salvas, por ID — usado
+    pra consolidar produtos parecidos numa única pasta (ver ferramenta de
+    mesclagem/migração). Cada item de `itens` é um dict com "id" e, opcional,
+    "produto" e/ou "nome". Devolve a lista de IDs não encontrados."""
+    payload = json.dumps({"acao": "renomearProdutos", "itens": itens}).encode("utf-8")
+    corpo = _requisitar(sheets_webhook_url(), dados=payload, metodo="POST")
+    return corpo.get("idsNaoEncontrados", [])
 
 
 class SheetsWorker(QThread):
-    """Executa uma função de rede (sheets_buscar/sheets_salvar/sheets_remover)
-    em segundo plano e avisa o resultado via sinal Qt."""
+    """Executa uma função de rede (sheets_buscar/sheets_salvar/sheets_remover
+    ou ler_nota_fiscal_ia) em segundo plano e avisa o resultado via sinal Qt."""
 
     concluido = pyqtSignal(bool, object)  # (sucesso, resultado_ou_mensagem_de_erro)
 
@@ -235,7 +691,7 @@ class SheetsWorker(QThread):
         try:
             resultado = self._funcao(*self._args, **self._kwargs)
             self.concluido.emit(True, resultado)
-        except ErroSheets as e:
+        except (ErroSheets, ErroIA) as e:
             self.concluido.emit(False, str(e))
         except Exception as e:
             self.concluido.emit(False, f"Erro inesperado: {e}")
@@ -449,9 +905,9 @@ class MiniGraficoPreco(QWidget):
 # --------------------------------------------------------------------------- #
 
 class TabelaComNavegacaoEnter(QTableWidget):
-    """QTableWidget da tela de compras: Enter avança Data -> Quantidade ->
-    Preço Unitário em vez do padrão do Qt. Em Preço Unitário só confirma o
-    valor e para ali, sem criar linha nova."""
+    """QTableWidget da tela de compras: Enter avança Nome -> Data ->
+    Quantidade -> Preço Unitário em vez do padrão do Qt. Em Preço Unitário só
+    confirma o valor e para ali, sem criar linha nova."""
 
     # O hint oficial do Enter se chama "SubmitModelData", mas em algumas
     # versões do binding PyQt6 aparece como "SubmitModelCache" (erro
@@ -468,7 +924,7 @@ class TabelaComNavegacaoEnter(QTableWidget):
         row, col = self.currentRow(), self.currentColumn()
         super().closeEditor(editor, QAbstractItemDelegate.EndEditHint.NoHint)
 
-        proxima_coluna = {COL_DATA: COL_QTD, COL_QTD: COL_PRECO_UNIT}.get(col)
+        proxima_coluna = {COL_NOME: COL_DATA, COL_DATA: COL_QTD, COL_QTD: COL_PRECO_UNIT}.get(col)
         if proxima_coluna is None:
             return  # estava em Preço Unitário: fica parado ali, sem criar linha nova
 
@@ -694,6 +1150,7 @@ class ProductEntriesPage(QWidget):
         dados = dados or {}
         self._carregando = True
 
+        item_nome = QTableWidgetItem(dados.get("nome") or "")
         item_data = QTableWidgetItem(dados.get("data") or QDate.currentDate().toString("dd/MM/yyyy"))
         item_data.setData(Qt.ItemDataRole.UserRole, dados.get("id"))
         item_qtd = QTableWidgetItem(str(dados.get("quantidade", "")) if dados.get("quantidade") else "")
@@ -701,7 +1158,7 @@ class ProductEntriesPage(QWidget):
         item_total = QTableWidgetItem(format_moeda(dados.get("preco_total", 0.0)))
         item_total.setFlags(item_total.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-        for col, item in enumerate([item_data, item_qtd, item_preco, item_total]):
+        for col, item in enumerate([item_nome, item_data, item_qtd, item_preco, item_total]):
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.tabela.setItem(row, col, item)
 
@@ -734,6 +1191,7 @@ class ProductEntriesPage(QWidget):
         item_data = self.tabela.item(row, COL_DATA)
         return {
             "id": self._id_da_linha(row),
+            "nome": self._texto_celula(row, COL_NOME),
             "data": self._texto_celula(row, COL_DATA),
             "quantidade": qtd_txt,
             "preco_unitario": preco_txt,
@@ -911,6 +1369,7 @@ class ProductEntriesPage(QWidget):
                 continue  # já está salva e não foi tocada — não reenvia à toa
 
             registro = {
+                "nome": self._texto_celula(row, COL_NOME),
                 "data": self._texto_celula(row, COL_DATA),
                 "quantidade": qtd,
                 "preco_unitario": preco,
@@ -1013,17 +1472,411 @@ class ProductEntriesPage(QWidget):
 
 
 # --------------------------------------------------------------------------- #
+# Diálogo de configuração (URL da planilha + chave da API do Gemini + modelo)
+# --------------------------------------------------------------------------- #
+
+def _campo_segredo(valor: str, placeholder: str):
+    """Um QLineEdit em modo senha + um botão 👁 pra revelar. Devolve
+    (QHBoxLayout, QLineEdit) — usado pra URL da planilha e chave da API, que
+    são segredos e não devem ficar visíveis na tela por padrão."""
+    campo = QLineEdit(valor)
+    campo.setEchoMode(QLineEdit.EchoMode.Password)
+    campo.setPlaceholderText(placeholder)
+    botao_ver = QPushButton("👁")
+    botao_ver.setCheckable(True)
+    botao_ver.setFixedWidth(36)
+    botao_ver.setToolTip("Mostrar/ocultar")
+    botao_ver.toggled.connect(
+        lambda ver: campo.setEchoMode(
+            QLineEdit.EchoMode.Normal if ver else QLineEdit.EchoMode.Password
+        )
+    )
+    linha = QHBoxLayout()
+    linha.addWidget(campo)
+    linha.addWidget(botao_ver)
+    return linha, campo
+
+
+class ConfigDialog(QDialog):
+    """Janela pra configurar a URL do Web App do Apps Script (obrigatória) e,
+    opcionalmente, a chave da API do Google Gemini + o modelo (só pra ler notas
+    fiscais). Grava em ~/.config/controle_empresas/config.json (via
+    salvar_config). O botão "Buscar modelos" lista os modelos que a chave
+    informada libera. A URL e a chave são segredos: não ficam no código nem
+    no git, e o app também aceita as duas por variável de ambiente
+    (GOOGLE_SHEETS_WEBHOOK_URL / GEMINI_API_KEY)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configurar")
+        self.setMinimumWidth(480)
+        config = carregar_config()
+
+        layout = QVBoxLayout(self)
+
+        explicacao = QLabel(
+            "A URL da planilha é o endereço do Web App do Apps Script (termina em /exec) — "
+            "sem ela o app não abre nenhuma empresa.\n"
+            "A chave da API do Google Gemini é opcional: só serve pra ler notas fiscais por "
+            "foto/link. Crie uma gratuita em aistudio.google.com/apikey."
+        )
+        explicacao.setWordWrap(True)
+        explicacao.setStyleSheet("color: #999;")
+        layout.addWidget(explicacao)
+
+        formulario = QFormLayout()
+
+        linha_url, self.campo_url = _campo_segredo(
+            config.get("sheets_webhook_url", ""),
+            "https://script.google.com/macros/s/.../exec",
+        )
+        formulario.addRow("URL da planilha:", linha_url)
+
+        linha_chave, self.campo_chave = _campo_segredo(config.get("gemini_api_key", ""), "AIza...")
+        formulario.addRow("Chave da API (IA):", linha_chave)
+
+        self.combo_modelo = QComboBox()
+        self.combo_modelo.setEditable(True)
+        self.combo_modelo.addItem(config.get("gemini_modelo") or MODELO_IA_PADRAO)
+        botao_buscar = QPushButton("Buscar modelos")
+        botao_buscar.clicked.connect(self._buscar_modelos)
+        linha_modelo = QHBoxLayout()
+        linha_modelo.addWidget(self.combo_modelo)
+        linha_modelo.addWidget(botao_buscar)
+        formulario.addRow("Modelo:", linha_modelo)
+
+        layout.addLayout(formulario)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        botoes = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        botoes.accepted.connect(self._salvar)
+        botoes.rejected.connect(self.reject)
+        layout.addWidget(botoes)
+
+    def _buscar_modelos(self):
+        chave = self.campo_chave.text().strip()
+        if not chave:
+            self.status.setStyleSheet("color: #c0392b;")
+            self.status.setText("Cole a chave da API primeiro.")
+            return
+        self.status.setStyleSheet("color: #d9a441;")
+        self.status.setText("Buscando modelos disponíveis...")
+        QApplication.processEvents()
+        try:
+            modelos = listar_modelos_ia(api_key=chave)
+        except ErroIA as e:
+            self.status.setStyleSheet("color: #c0392b;")
+            self.status.setText(str(e))
+            return
+        if not modelos:
+            self.status.setStyleSheet("color: #c0392b;")
+            self.status.setText("Nenhum modelo compatível encontrado pra essa chave.")
+            return
+        atual = self.combo_modelo.currentText().strip()
+        self.combo_modelo.clear()
+        self.combo_modelo.addItems(modelos)
+        preferido = next(
+            (m for m in modelos if "flash" in m and "lite" not in m and "image" not in m),
+            atual if atual in modelos else modelos[0],
+        )
+        self.combo_modelo.setCurrentText(atual if atual in modelos else preferido)
+        self.status.setStyleSheet("color: #2e7d32;")
+        self.status.setText(f"{len(modelos)} modelo(s) disponível(is).")
+
+    def _salvar(self):
+        url = self.campo_url.text().strip()
+        chave = self.campo_chave.text().strip()
+        modelo = self.combo_modelo.currentText().strip() or MODELO_IA_PADRAO
+
+        if not url and not chave:
+            self.status.setStyleSheet("color: #c0392b;")
+            self.status.setText("Preencha pelo menos a URL da planilha.")
+            return
+        if url and not re.match(r"https://script\.google\.com/.+/exec/?$", url):
+            self.status.setStyleSheet("color: #c0392b;")
+            self.status.setText("A URL deve ser a do Web App do Apps Script e terminar em /exec.")
+            return
+
+        config = carregar_config()
+        config["sheets_webhook_url"] = url
+        config["gemini_api_key"] = chave
+        config["gemini_modelo"] = modelo
+        try:
+            salvar_config(config)
+        except OSError as e:
+            QMessageBox.critical(self, "Erro ao salvar", f"Não consegui gravar a configuração:\n{e}")
+            return
+        self.accept()
+
+
+# --------------------------------------------------------------------------- #
+# Página de conferência dos itens lidos por foto de uma nota fiscal
+# --------------------------------------------------------------------------- #
+
+class ImportarNotaFiscalPage(QWidget):
+    """Página cheia (não é uma janela flutuante) pra revisar os itens que a
+    IA leu de uma foto de nota fiscal: a própria foto fica visível à
+    esquerda, pra conferência lado a lado, e a tabela à direita mostra cada
+    item reconhecido — pra qual pasta ele vai, com que nome, data, quantidade
+    e preço. Nada é salvo no Sheets até o usuário revisar e clicar em
+    "✅ Confirmar tudo"."""
+
+    COL_PASTA, COL_NOME, COL_DATA, COL_QTD, COL_PRECO = range(5)
+
+    def __init__(self, empresa: dict, caminho_imagem: str, itens_lidos: list, pastas_existentes: list,
+                 voltar_callback, ao_confirmar_callback):
+        super().__init__()
+        self.empresa = empresa
+        self.cor = empresa["cor"]
+        self.caminho_imagem = caminho_imagem
+        self.pastas_existentes = sorted(pastas_existentes, key=str.lower)
+        self.voltar_callback = voltar_callback
+        self.ao_confirmar_callback = ao_confirmar_callback  # chamado com a quantidade salva, após sucesso
+        self._operacao_em_andamento = False
+        self._workers_ativos = []  # referências fortes aos SheetsWorker em voo (ver _disparar_worker)
+        self._destruida = False  # ver marcar_destruida, mesmo padrão das outras páginas
+
+        self._montar_ui()
+        self._popular_tabela(itens_lidos)
+
+    def marcar_destruida(self):
+        self._destruida = True
+
+    def _montar_ui(self):
+        layout_principal = QHBoxLayout(self)
+        layout_principal.setContentsMargins(16, 16, 16, 16)
+        layout_principal.setSpacing(16)
+
+        # -- painel esquerdo: a foto da nota (quando veio de foto), pra conferência --
+        painel_foto_widget = QWidget()
+        painel_foto_widget.setMaximumWidth(420)
+        painel_foto = QVBoxLayout(painel_foto_widget)
+        painel_foto.setContentsMargins(0, 0, 0, 0)
+
+        veio_de_foto = bool(self.caminho_imagem) and not QPixmap(self.caminho_imagem).isNull()
+
+        titulo_foto = QLabel("📷 Nota importada" if veio_de_foto else "🔗 Nota importada por link")
+        titulo_foto.setStyleSheet(f"color: {self.cor}; font-weight: bold; font-size: 14px;")
+        painel_foto.addWidget(titulo_foto)
+
+        self.label_foto = QLabel()
+        self.label_foto.setWordWrap(True)
+        self.label_foto.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        if veio_de_foto:
+            self._pixmap_original = QPixmap(self.caminho_imagem)
+            self.label_foto.setPixmap(
+                self._pixmap_original.scaledToWidth(380, Qt.TransformationMode.SmoothTransformation)
+            )
+        else:
+            self._pixmap_original = QPixmap()
+            self.label_foto.setText(
+                "Os itens ao lado vieram da página oficial da SEFAZ (via link do QR code).\n\n"
+                "Confira mesmo assim antes de confirmar."
+            )
+            self.label_foto.setStyleSheet("color: #999;")
+
+        scroll_foto = QScrollArea()
+        scroll_foto.setWidget(self.label_foto)
+        scroll_foto.setWidgetResizable(True)
+        painel_foto.addWidget(scroll_foto)
+
+        layout_principal.addWidget(painel_foto_widget)
+
+        # -- painel direito: itens reconhecidos, editáveis, com pasta de destino --
+        painel_direito = QVBoxLayout()
+
+        linha_titulo = QHBoxLayout()
+        self.btn_voltar = QPushButton("← Cancelar")
+        self.btn_voltar.clicked.connect(self._cancelar)
+        linha_titulo.addWidget(self.btn_voltar)
+
+        titulo = QLabel("Conferir itens da nota")
+        fonte_titulo = QFont()
+        fonte_titulo.setPointSize(16)
+        fonte_titulo.setBold(True)
+        titulo.setFont(fonte_titulo)
+        titulo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        titulo.setStyleSheet(f"color: {self.cor};")
+        linha_titulo.addWidget(titulo, stretch=1)
+
+        espacador = QLabel("")
+        espacador.setMinimumWidth(self.btn_voltar.sizeHint().width())
+        linha_titulo.addWidget(espacador)
+        painel_direito.addLayout(linha_titulo)
+
+        dica = QLabel(
+            "Confira ou corrija a pasta, nome, data, quantidade e preço de cada item antes de confirmar. "
+            "Pastas que ainda não existem são criadas na hora."
+        )
+        dica.setWordWrap(True)
+        dica.setStyleSheet("color: #999;")
+        painel_direito.addWidget(dica)
+
+        self.tabela = QTableWidget(0, 5)
+        self.tabela.setHorizontalHeaderLabels(["Pasta (produto)", "Nome", "Data", "Quantidade", "Preço Unitário"])
+        self.tabela.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tabela.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tabela.setAlternatingRowColors(True)
+        self.tabela.horizontalHeader().setStyleSheet(
+            f"QHeaderView::section {{ background-color: {self.cor}; color: {self.empresa['cor_texto']}; "
+            f"padding: 6px; font-weight: bold; }}"
+        )
+        painel_direito.addWidget(self.tabela)
+
+        botoes = QHBoxLayout()
+        self.btn_add = QPushButton("+ Adicionar item")
+        self.btn_add.clicked.connect(lambda: self._adicionar_linha())
+        self.btn_remover = QPushButton("- Remover item selecionado")
+        self.btn_remover.clicked.connect(self._remover_linha)
+        botoes.addWidget(self.btn_add)
+        botoes.addWidget(self.btn_remover)
+        botoes.addStretch()
+
+        self.btn_confirmar = QPushButton("✅ Confirmar tudo")
+        self.btn_confirmar.setStyleSheet(
+            f"QPushButton {{ background-color: {self.cor}; color: {self.empresa['cor_texto']}; "
+            f"font-weight: bold; padding: 8px 18px; border-radius: 4px; }}"
+        )
+        self.btn_confirmar.clicked.connect(self._confirmar_tudo)
+        botoes.addWidget(self.btn_confirmar)
+        painel_direito.addLayout(botoes)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #2e7d32;")
+        painel_direito.addWidget(self.status_label)
+
+        layout_principal.addLayout(painel_direito, stretch=1)
+
+    def _definir_ocupado(self, ocupado: bool, mensagem: str = ""):
+        self._operacao_em_andamento = ocupado
+        for botao in (self.btn_add, self.btn_remover, self.btn_confirmar, self.btn_voltar):
+            botao.setEnabled(not ocupado)
+        if mensagem:
+            self.status_label.setStyleSheet("color: #d9a441;")
+            self.status_label.setText(mensagem)
+
+    def _popular_tabela(self, itens: list):
+        if itens:
+            for item in itens:
+                self._adicionar_linha(item)
+        else:
+            self._adicionar_linha()  # nenhum item reconhecido: começa com 1 linha em branco
+
+    def _adicionar_linha(self, dados: dict = None):
+        dados = dados or {}
+        row = self.tabela.rowCount()
+        self.tabela.insertRow(row)
+
+        combo_pasta = QComboBox()
+        combo_pasta.setEditable(True)
+        combo_pasta.addItems(self.pastas_existentes)
+        pasta_sugerida = dados.get("pasta") or sugerir_pasta(dados.get("nome", ""), self.pastas_existentes)
+        combo_pasta.setCurrentText(pasta_sugerida or dados.get("nome", ""))
+        self.tabela.setCellWidget(row, self.COL_PASTA, combo_pasta)
+
+        item_nome = QTableWidgetItem(dados.get("nome", ""))
+        item_data = QTableWidgetItem(dados.get("data") or QDate.currentDate().toString("dd/MM/yyyy"))
+        item_qtd = QTableWidgetItem(str(dados.get("quantidade", "")))
+        item_preco = QTableWidgetItem(str(dados.get("preco_unitario", "")))
+        for col, item in ((self.COL_NOME, item_nome), (self.COL_DATA, item_data),
+                           (self.COL_QTD, item_qtd), (self.COL_PRECO, item_preco)):
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.tabela.setItem(row, col, item)
+        return row
+
+    def _remover_linha(self):
+        row = self.tabela.currentRow()
+        if row >= 0:
+            self.tabela.removeRow(row)
+
+    def _texto_celula(self, row: int, col: int) -> str:
+        item = self.tabela.item(row, col)
+        return item.text().strip() if item else ""
+
+    def _cancelar(self):
+        self.voltar_callback()
+
+    def _confirmar_tudo(self):
+        if self._operacao_em_andamento:
+            return
+
+        novas, ignoradas = [], 0
+        for row in range(self.tabela.rowCount()):
+            combo = self.tabela.cellWidget(row, self.COL_PASTA)
+            pasta = combo.currentText().strip() if combo else ""
+            qtd = parse_numero(self._texto_celula(row, self.COL_QTD))
+            preco = parse_numero(self._texto_celula(row, self.COL_PRECO))
+            if not pasta or qtd <= 0 or preco <= 0:
+                ignoradas += 1  # linha incompleta: não trava a confirmação das outras, mas conta
+                continue
+
+            novas.append({
+                "id": gerar_id(),
+                "empresa": self.empresa["nome"],
+                "produto": pasta,
+                "nome": self._texto_celula(row, self.COL_NOME),
+                "data": self._texto_celula(row, self.COL_DATA),
+                "quantidade": qtd,
+                "preco_unitario": preco,
+                "preco_total": qtd * preco,
+            })
+
+        if not novas:
+            QMessageBox.warning(
+                self, "Nada pra confirmar",
+                "Preencha pelo menos um item com pasta, quantidade e preço maiores que zero.",
+            )
+            return
+
+        if ignoradas:
+            resposta = QMessageBox.question(
+                self, "Linhas incompletas",
+                f"{ignoradas} linha(s) sem pasta, quantidade ou preço válido vão ser ignoradas.\n"
+                f"Salvar as outras {len(novas)}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if resposta != QMessageBox.StandardButton.Yes:
+                return
+
+        self._definir_ocupado(True, f"Salvando {len(novas)} item(ns) no Google Sheets...")
+        worker = SheetsWorker(sheets_salvar, novas, [])
+        self._workers_ativos.append(worker)
+
+        def _finalizar(sucesso, resultado):
+            if worker in self._workers_ativos:
+                self._workers_ativos.remove(worker)
+            if self._destruida:
+                return  # a página já foi fechada/trocada enquanto a rede respondia
+            self._definir_ocupado(False)
+            if sucesso:
+                self.ao_confirmar_callback(len(novas))
+            else:
+                self.status_label.setStyleSheet("color: #c0392b;")
+                self.status_label.setText(f"Falha ao salvar: {resultado}")
+                QMessageBox.critical(self, "Erro ao salvar", str(resultado))
+
+        worker.concluido.connect(_finalizar)
+        worker.start()
+
+
+# --------------------------------------------------------------------------- #
 # Página 2: lista de produtos de uma empresa
 # --------------------------------------------------------------------------- #
 
 class ProductListPage(QWidget):
     COL_PRODUTO, COL_ULTIMA_DATA, COL_ULTIMO_VALOR, COL_ABRIR = range(4)
 
-    def __init__(self, empresa: dict, abrir_produto_callback, voltar_callback):
+    def __init__(self, empresa: dict, abrir_produto_callback, abrir_importar_foto_callback, voltar_callback):
         super().__init__()
         self.empresa = empresa
         self.cor = empresa["cor"]
         self.abrir_produto_callback = abrir_produto_callback
+        self.abrir_importar_foto_callback = abrir_importar_foto_callback
         self.voltar_callback = voltar_callback
 
         self._linhas_por_produto = {}   # produto -> [linhas da planilha]
@@ -1044,8 +1897,31 @@ class ProductListPage(QWidget):
         layout.setSpacing(10)
 
         linha_titulo = QHBoxLayout()
+        bloco_esquerdo_widget = QWidget()
+        bloco_esquerdo = QHBoxLayout(bloco_esquerdo_widget)
+        bloco_esquerdo.setContentsMargins(0, 0, 0, 0)
+        bloco_esquerdo.setSpacing(10)
+
         btn_voltar = QPushButton("← Voltar")
         btn_voltar.clicked.connect(self.voltar_callback)
+        bloco_esquerdo.addWidget(btn_voltar)
+        bloco_esquerdo.addSpacing(28)  # afasta o botão de importar do "Voltar"
+
+        self.btn_importar_foto = QPushButton("📷 Importar nota fiscal")
+        self.btn_importar_foto.setStyleSheet(
+            f"QPushButton {{ background-color: {self.cor}; color: {self.empresa['cor_texto']}; "
+            f"font-weight: bold; font-size: 13px; padding: 10px 18px; border-radius: 4px; }}"
+        )
+        self.btn_importar_foto.clicked.connect(self._importar_de_foto)
+        bloco_esquerdo.addWidget(self.btn_importar_foto)
+
+        self.btn_importar_link = QPushButton("🔗 Importar por link")
+        self.btn_importar_link.setToolTip(
+            "Cole o link do QR code da nota fiscal (NFC-e) — o app busca a página oficial "
+            "da SEFAZ e a IA extrai os itens de lá"
+        )
+        self.btn_importar_link.clicked.connect(self._importar_por_link)
+        bloco_esquerdo.addWidget(self.btn_importar_link)
 
         titulo = QLabel(self.empresa["nome"])
         fonte_titulo = QFont()
@@ -1070,7 +1946,14 @@ class ProductListPage(QWidget):
         self.btn_pesquisar.clicked.connect(self._alternar_pesquisa)
         bloco_direito.addWidget(self.btn_pesquisar)
 
-        linha_titulo.addWidget(btn_voltar)
+        # o título só fica centralizado de verdade se os blocos das duas
+        # pontas tiverem a mesma largura — o esquerdo cresceu com o botão de
+        # importar nota fiscal, então igualamos os dois pela largura do maior
+        largura_maior = max(bloco_esquerdo_widget.sizeHint().width(), bloco_direito_widget.sizeHint().width())
+        bloco_esquerdo_widget.setMinimumWidth(largura_maior)
+        bloco_direito_widget.setMinimumWidth(largura_maior)
+
+        linha_titulo.addWidget(bloco_esquerdo_widget)
         linha_titulo.addWidget(titulo, stretch=1)
         linha_titulo.addWidget(bloco_direito_widget)
         layout.addLayout(linha_titulo)
@@ -1117,10 +2000,15 @@ class ProductListPage(QWidget):
         self.btn_recarregar = QPushButton("🔄 Recarregar do Sheets")
         self.btn_recarregar.clicked.connect(self.recarregar)
 
+        self.btn_config_ia = QPushButton("⚙️ Configurar")
+        self.btn_config_ia.setToolTip("URL da planilha, chave da API e modelo da IA")
+        self.btn_config_ia.clicked.connect(self._configurar_ia)
+
         botoes.addWidget(self.btn_add)
         botoes.addWidget(self.btn_remover)
         botoes.addWidget(self.btn_recarregar)
         botoes.addStretch()
+        botoes.addWidget(self.btn_config_ia)
         layout.addLayout(botoes)
 
         self.status_label = QLabel("")
@@ -1135,7 +2023,8 @@ class ProductListPage(QWidget):
 
     def _definir_ocupado(self, ocupado: bool):
         self._operacao_em_andamento = ocupado
-        for botao in (self.btn_add, self.btn_remover, self.btn_recarregar):
+        for botao in (self.btn_add, self.btn_remover, self.btn_recarregar,
+                      self.btn_importar_foto, self.btn_importar_link, self.btn_config_ia):
             botao.setEnabled(not ocupado)
 
     def _disparar_worker(self, funcao, *args, ao_concluir):
@@ -1261,7 +2150,13 @@ class ProductListPage(QWidget):
 
         ultima = obter_ultima_compra(self._linhas_por_produto.get(nome_produto, []))
         data_txt = (ultima.get("data") if ultima else None) or "-"
-        valor_txt = format_moeda((ultima.get("quantidade", 0) * ultima.get("preco_unitario", 0)) if ultima else 0)
+        # parse_numero tolera célula vazia/texto: o Sheets ou o cache podem
+        # devolver quantidade/preço como string, e "" * float é TypeError
+        total_ultima = (
+            parse_numero(str(ultima.get("quantidade", ""))) * parse_numero(str(ultima.get("preco_unitario", "")))
+            if ultima else 0
+        )
+        valor_txt = format_moeda(total_ultima)
 
         item_nome = QTableWidgetItem(nome_produto)
         item_nome.setFlags(item_nome.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -1289,6 +2184,86 @@ class ProductListPage(QWidget):
     def _abrir_produto(self, nome_produto: str):
         linhas = self._linhas_por_produto.get(nome_produto, [])
         self.abrir_produto_callback(self.empresa, nome_produto, linhas)
+
+    def _configurar_ia(self):
+        ConfigDialog(self).exec()
+
+    def _garantir_ia_configurada(self) -> bool:
+        """Se ainda não há chave da API, oferece abrir a configuração. Devolve
+        True se dá pra seguir (chave presente)."""
+        if ia_api_key():
+            return True
+        resposta = QMessageBox.question(
+            self, "IA não configurada",
+            "Pra importar uma nota fiscal é preciso configurar a chave da API "
+            "do Google Gemini.\n\nQuer configurar agora?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if resposta != QMessageBox.StandardButton.Yes:
+            return False
+        return ConfigDialog(self).exec() == QDialog.DialogCode.Accepted and bool(ia_api_key())
+
+    def _importar_de_foto(self):
+        """Envia uma foto de nota fiscal pra IA (Google Gemini), que devolve
+        os itens já estruturados, e abre a página de conferência com a foto
+        do lado — nada é salvo até o usuário revisar e confirmar lá."""
+        if self._operacao_em_andamento or not self._garantir_ia_configurada():
+            return
+
+        caminho, _ = QFileDialog.getOpenFileName(
+            self, "Selecionar foto da nota", "",
+            "Imagens (*.png *.jpg *.jpeg *.bmp *.webp *.heic *.heif)"
+        )
+        if not caminho:
+            return
+
+        self._definir_ocupado(True)
+        self.status_label.setStyleSheet("color: #d9a441;")
+        self.status_label.setText("Lendo a nota fiscal com a IA (pode levar alguns segundos)...")
+        self._disparar_worker(ler_nota_fiscal_ia, caminho,
+                              ao_concluir=lambda ok, res: self._on_leitura_ia(ok, res, caminho))
+
+    def _importar_por_link(self):
+        """Pede o link do QR code de uma NFC-e, baixa a página oficial da
+        SEFAZ e manda o texto pra IA extrair os itens — mesma tela de
+        conferência da importação por foto."""
+        if self._operacao_em_andamento or not self._garantir_ia_configurada():
+            return
+
+        url, ok = QInputDialog.getText(
+            self, "Importar nota por link",
+            "Cole o link do QR code da nota fiscal\n(escaneie o QR com a câmera do celular e copie o endereço):",
+        )
+        url = (url or "").strip()
+        if not ok or not url:
+            return
+
+        self._definir_ocupado(True)
+        self.status_label.setStyleSheet("color: #d9a441;")
+        self.status_label.setText("Baixando a nota da SEFAZ e lendo com a IA...")
+        self._disparar_worker(ler_nota_fiscal_link, url,
+                              ao_concluir=lambda ok_, res: self._on_leitura_ia(ok_, res, ""))
+
+    def _on_leitura_ia(self, sucesso: bool, resultado, origem: str):
+        """Callback comum das duas importações (foto e link). `origem` é o
+        caminho da imagem, ou "" quando veio de um link."""
+        self._definir_ocupado(False)
+        self.status_label.setText("")
+        if not sucesso:
+            self.status_label.setStyleSheet("color: #c0392b;")
+            self.status_label.setText(f"Falha ao ler a nota: {resultado}")
+            QMessageBox.critical(self, "Erro ao ler a nota fiscal", str(resultado))
+            return
+
+        itens = resultado
+        if not itens:
+            QMessageBox.information(
+                self, "Nenhum item reconhecido",
+                "A IA não encontrou itens de compra nessa nota. Você pode abrir a tela de "
+                "conferência mesmo assim e adicionar os itens na mão.",
+            )
+        pastas_existentes = sorted(set(list(self._linhas_por_produto.keys()) + self._produtos_pendentes), key=str.lower)
+        self.abrir_importar_foto_callback(self.empresa, origem, itens, pastas_existentes)
 
     def _adicionar_produto(self):
         nome, ok = QInputDialog.getText(self, "Novo item", "Nome do novo produto:")
@@ -1377,8 +2352,12 @@ class CompanySelectPage(QWidget):
         layout_externo.addWidget(titulo)
         layout_externo.addSpacing(30)
 
-        if not GOOGLE_SHEETS_WEBHOOK_URL:
-            aviso = QLabel("⚠ GOOGLE_SHEETS_WEBHOOK_URL não configurada — configure no topo do arquivo .py")
+        if not sheets_webhook_url():
+            aviso = QLabel(
+                "⚠ URL da planilha não configurada — abra uma empresa e clique em "
+                "\"⚙️ Configurar\" pra colar a URL do Web App do Apps Script."
+            )
+            aviso.setWordWrap(True)
             aviso.setAlignment(Qt.AlignmentFlag.AlignCenter)
             aviso.setStyleSheet("color: #e74c3c; font-weight: bold;")
             layout_externo.addWidget(aviso)
@@ -1436,6 +2415,7 @@ class MainWindow(QMainWindow):
 
         self._paginas_produtos = {}    # nome_empresa -> ProductListPage
         self._pagina_entradas_atual = None
+        self._pagina_importar_atual = None
 
     def abrir_empresa(self, empresa: dict):
         nome_empresa = empresa["nome"]
@@ -1443,6 +2423,7 @@ class MainWindow(QMainWindow):
             pagina = ProductListPage(
                 empresa,
                 abrir_produto_callback=self.abrir_produto,
+                abrir_importar_foto_callback=self.abrir_importar_nota_fiscal,
                 voltar_callback=self.voltar_para_selecao,
             )
             self._paginas_produtos[nome_empresa] = pagina
@@ -1469,6 +2450,28 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(pagina)
         self.stack.setCurrentWidget(pagina)
 
+    def abrir_importar_nota_fiscal(self, empresa: dict, caminho_imagem: str, itens_lidos: list, pastas_existentes: list):
+        pagina = ImportarNotaFiscalPage(
+            empresa, caminho_imagem, itens_lidos, pastas_existentes,
+            voltar_callback=lambda: self.voltar_para_lista_produtos(empresa),
+            ao_confirmar_callback=lambda quantidade: self._on_nota_fiscal_confirmada(empresa, quantidade),
+        )
+        if self._pagina_importar_atual is not None:
+            self._pagina_importar_atual.marcar_destruida()
+            self.stack.removeWidget(self._pagina_importar_atual)
+            self._pagina_importar_atual.deleteLater()
+
+        self._pagina_importar_atual = pagina
+        self.stack.addWidget(pagina)
+        self.stack.setCurrentWidget(pagina)
+
+    def _on_nota_fiscal_confirmada(self, empresa: dict, quantidade: int):
+        QMessageBox.information(
+            self, "Itens salvos",
+            f"{quantidade} item(ns) salvo(s) com sucesso no Google Sheets.",
+        )
+        self.voltar_para_lista_produtos(empresa)
+
     def voltar_para_lista_produtos(self, empresa: dict):
         nome_empresa = empresa["nome"]
         self.stack.setCurrentWidget(self._paginas_produtos[nome_empresa])
@@ -1478,9 +2481,35 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.pagina_selecao)
 
 
+def aplicar_tema_escuro(app: QApplication):
+    """Paleta escura fixa, aplicada por cima do estilo Fusion — o app sempre
+    fica com esse visual, não importa o tema (claro/escuro) do sistema ou do
+    ambiente onde for executado."""
+    paleta = QPalette()
+    paleta.setColor(QPalette.ColorRole.Window, QColor(37, 37, 38))
+    paleta.setColor(QPalette.ColorRole.WindowText, QColor(220, 220, 220))
+    paleta.setColor(QPalette.ColorRole.Base, QColor(30, 30, 30))
+    paleta.setColor(QPalette.ColorRole.AlternateBase, QColor(45, 45, 48))
+    paleta.setColor(QPalette.ColorRole.ToolTipBase, QColor(220, 220, 220))
+    paleta.setColor(QPalette.ColorRole.ToolTipText, QColor(37, 37, 38))
+    paleta.setColor(QPalette.ColorRole.Text, QColor(220, 220, 220))
+    paleta.setColor(QPalette.ColorRole.Button, QColor(51, 51, 55))
+    paleta.setColor(QPalette.ColorRole.ButtonText, QColor(220, 220, 220))
+    paleta.setColor(QPalette.ColorRole.BrightText, QColor(255, 80, 80))
+    paleta.setColor(QPalette.ColorRole.Link, QColor(100, 160, 220))
+    paleta.setColor(QPalette.ColorRole.Highlight, QColor(60, 110, 165))
+    paleta.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+    paleta.setColor(QPalette.ColorRole.PlaceholderText, QColor(150, 150, 150))
+    paleta.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(120, 120, 120))
+    paleta.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(120, 120, 120))
+    paleta.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(120, 120, 120))
+    app.setPalette(paleta)
+
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    aplicar_tema_escuro(app)
     janela = MainWindow()
     janela.show()
     sys.exit(app.exec())

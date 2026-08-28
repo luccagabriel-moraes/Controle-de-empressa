@@ -1,4 +1,4 @@
-var CABECALHO = ["ID", "Empresa", "Produto", "Data", "Quantidade", "Preço Unitário", "Preço Total"];
+var CABECALHO = ["ID", "Empresa", "Produto", "Nome", "Data", "Quantidade", "Preço Unitário", "Preço Total"];
 var NUM_COLUNAS = CABECALHO.length;
 
 var CACHE_CHAVE_BASE = "linhas_planilha";
@@ -42,8 +42,32 @@ function getPlanilha() {
   if (planilha.getLastRow() === 0) {
     planilha.appendRow(CABECALHO);
   }
+  garantirColunaNome(planilha);
   garantirFormatoTexto(planilha);
   return planilha;
+}
+
+// Migração automática: planilhas criadas antes da coluna "Nome" existir têm
+// o cabeçalho antigo (ID, Empresa, Produto, Data, ...). Detecta isso e abre
+// espaço pra "Nome" logo depois de "Produto", empurrando Data/Quantidade/
+// Preço Unitário/Preço Total uma coluna pra direita sem perder nenhum dado
+// (insertColumnBefore desloca o conteúdo das células, não apaga). Roda só
+// uma vez por planilha — depois disso o cabeçalho já bate com CABECALHO.
+function garantirColunaNome(planilha) {
+  var props = PropertiesService.getScriptProperties();
+  var chave = "COLUNA_NOME_ADICIONADA_" + planilha.getSheetId();
+  if (props.getProperty(chave) === "1") return;
+
+  var larguraCabecalho = Math.max(planilha.getLastColumn(), 1);
+  var cabecalhoAtual = planilha.getRange(1, 1, 1, larguraCabecalho).getValues()[0];
+  if (cabecalhoAtual.indexOf("Nome") === -1) {
+    planilha.insertColumnBefore(4); // coluna D: antes da antiga "Data"
+    planilha.getRange(1, 4).setValue("Nome");
+    // a coluna Data mudou de D pra E: força garantirFormatoTexto a rodar de
+    // novo agora, senão o formato de texto puro ficaria preso na coluna errada
+    props.deleteProperty("FORMATO_TEXTO_APLICADO_" + planilha.getSheetId());
+  }
+  props.setProperty(chave, "1");
 }
 
 // Formata as colunas ID e Data como texto puro ("@"), pra o Sheets nunca mais
@@ -54,7 +78,7 @@ function garantirFormatoTexto(planilha) {
   var chave = "FORMATO_TEXTO_APLICADO_" + planilha.getSheetId();
   if (props.getProperty(chave) === "1") return;
   planilha.getRange("A:A").setNumberFormat("@"); // ID
-  planilha.getRange("D:D").setNumberFormat("@"); // Data
+  planilha.getRange("E:E").setNumberFormat("@"); // Data (coluna E desde a coluna "Nome" ser adicionada)
   props.setProperty(chave, "1");
 }
 
@@ -81,10 +105,11 @@ function lerTodasLinhasDaPlanilha() {
       id: String(linha[0]), // nunca deixa um ID todo numérico virar Number aqui
       empresa: linha[1],
       produto: linha[2],
-      data: normalizarDataLida(linha[3]),
-      quantidade: linha[4],
-      preco_unitario: linha[5],
-      preco_total: linha[6],
+      nome: linha[3],
+      data: normalizarDataLida(linha[4]),
+      quantidade: linha[5],
+      preco_unitario: linha[6],
+      preco_total: linha[7],
     });
   }
   return linhas;
@@ -231,6 +256,12 @@ function doPost(e) {
       return responder({ ok: true, removidas: removidas });
     }
 
+    if (corpo.acao === "renomearProdutos") {
+      var resultadoRenomear = renomearProdutos(planilha, corpo.itens || []);
+      invalidarCache();
+      return responder({ ok: true, idsNaoEncontrados: resultadoRenomear.idsNaoEncontrados });
+    }
+
     return responder({ ok: false, erro: "Ação desconhecida: " + corpo.acao });
   } catch (erro) {
     return responder({ ok: false, erro: String(erro) });
@@ -248,7 +279,7 @@ function salvarRegistros(planilha, novas, existentes) {
   if (novas.length > 0) {
     var linhaInicial = planilha.getLastRow() + 1;
     var dados = novas.map(function (l) {
-      return [l.id, l.empresa, l.produto, l.data, l.quantidade, l.preco_unitario, l.preco_total];
+      return [l.id, l.empresa, l.produto, l.nome, l.data, l.quantidade, l.preco_unitario, l.preco_total];
     });
     planilha.getRange(linhaInicial, 1, dados.length, NUM_COLUNAS).setValues(dados);
   }
@@ -272,8 +303,8 @@ function salvarRegistros(planilha, novas, existentes) {
   if (linhasAlvo.length === 1) {
     // caso comum (uma linha só editada): grava direto, sem ler nada antes
     var item = linhasAlvo[0];
-    planilha.getRange(item.linha, 4, 1, 4)
-      .setValues([[item.dados.data, item.dados.quantidade, item.dados.preco_unitario, item.dados.preco_total]]);
+    planilha.getRange(item.linha, 4, 1, 5)
+      .setValues([[item.dados.nome, item.dados.data, item.dados.quantidade, item.dados.preco_unitario, item.dados.preco_total]]);
     return { idsNaoEncontrados: idsNaoEncontrados };
   }
 
@@ -286,14 +317,14 @@ function salvarRegistros(planilha, novas, existentes) {
   var numeros = linhasAlvo.map(function (item) { return item.linha; });
   var linhaMin = Math.min.apply(null, numeros);
   var linhaMax = Math.max.apply(null, numeros);
-  var bloco = planilha.getRange(linhaMin, 4, linhaMax - linhaMin + 1, 4).getValues();
+  var bloco = planilha.getRange(linhaMin, 4, linhaMax - linhaMin + 1, 5).getValues();
 
   linhasAlvo.forEach(function (item) {
     var offset = item.linha - linhaMin;
-    bloco[offset] = [item.dados.data, item.dados.quantidade, item.dados.preco_unitario, item.dados.preco_total];
+    bloco[offset] = [item.dados.nome, item.dados.data, item.dados.quantidade, item.dados.preco_unitario, item.dados.preco_total];
   });
 
-  planilha.getRange(linhaMin, 4, bloco.length, 4).setValues(bloco);
+  planilha.getRange(linhaMin, 4, bloco.length, 5).setValues(bloco);
   return { idsNaoEncontrados: idsNaoEncontrados };
 }
 
@@ -328,4 +359,27 @@ function removerRegistros(planilha, ids) {
   }
 
   return linhasParaRemover.length;
+}
+
+// Renomeia o produto (pasta) e/ou o nome de linhas já salvas, por ID — usado
+// pra consolidar produtos parecidos que viravam pastas separadas por engano
+// (ex: "Vinho pergola" e "Vinho randon" -> pasta "Vinho", com o nome de cada
+// marca guardado por linha). Cada item pode trazer "produto" e/ou "nome";
+// só a coluna informada é sobrescrita.
+function renomearProdutos(planilha, itens) {
+  var idsNaoEncontrados = [];
+  if (!itens.length) return { idsNaoEncontrados: idsNaoEncontrados };
+
+  var indice = construirIndiceIds(planilha); // uma única leitura, não uma por item
+  itens.forEach(function (item) {
+    var linha = indice[String(item.id)];
+    if (!linha) {
+      idsNaoEncontrados.push(item.id);
+      return;
+    }
+    if (item.produto !== undefined) planilha.getRange(linha, 3).setValue(item.produto);
+    if (item.nome !== undefined) planilha.getRange(linha, 4).setValue(item.nome);
+  });
+
+  return { idsNaoEncontrados: idsNaoEncontrados };
 }

@@ -13,6 +13,14 @@
 > **Changelog de correção (pós-revisão):** a primeira versão da navegação por Enter e do rótulo elidível tinha dois bugs — o hint do Qt usado para detectar o Enter estava errado (e seu nome no PyQt6 varia por versão do binding), e o rótulo elidível calculava a largura de corte antes de estar no layout de verdade, então nunca truncava nada. Os dois foram corrigidos e confirmados com testes isolados. Marcado nas seções com 🆕³.
 >
 > **Changelog de auditoria (revisão de bugs):** uma revisão dedicada (11 problemas confirmados) encontrou e corrigiu: (1) o backend gravava/lia sempre na aba "ativa" da planilha em vez de uma aba fixa; (2) datas podiam voltar com 1 dia de diferença dependendo do fuso horário da planilha; (3) um ID todo numérico podia perder um zero à esquerda; (4) o Apps Script descartava edições de linhas não encontradas sem avisar (respondia "ok" mesmo assim); (5) a exclusão instantânea de linha/produto, ao remover uma trava de segurança antiga, podia derrubar o app se duas ações de rede fossem disparadas em sequência rápida; (6) o backend não tinha nenhum bloqueio contra duas requisições simultâneas; (7) desfazer uma remoção que falhou "esquecia" que a linha restaurada tinha uma edição pendente; (8) o mesmo desfazer também zerava o Total mostrado; (9) o rastreamento de "linha editada" podia, em teoria, confundir uma linha nunca tocada com uma editada. Tudo detalhado nas seções marcadas com 🆕⁴.
+>
+> **Changelog de estrutura + importação por foto (esta revisão):** cada compra ganhou um campo **Nome** (novas colunas `COL_NOME`/"Nome" na tabela e no Sheets), separando "que tipo de produto é" (a pasta, ex: "Aveia Flocos") de "qual embalagem/marca foi comprada" (o Nome de cada linha, ex: "Aveia Flocos Marca X"). A tabela de compras passou a ter 5 colunas (Nome, Data, Quantidade, Preço Unitário, Preço Total) e a navegação por Enter ganhou mais um passo (Nome → Data → Quantidade → Preço Unitário). Novo botão **"📷 Importar nota fiscal"** na lista de produtos: envia a foto da nota para a **API do Google Gemini** (`ler_nota_fiscal_ia`), que devolve os itens já estruturados; o app sugere a pasta certa comparando palavras com as pastas já existentes (`sugerir_pasta`) e abre uma página de conferência (`ImportarNotaFiscalPage`) antes de qualquer coisa ir pro Sheets — nada é salvo sem revisão manual. A chave da API e o modelo ficam em `~/.config/controle_empresas/config.json` (`carregar_config`/`salvar_config`), configuráveis pelo diálogo `ConfigDialog`. No backend, `garantirColunaNome` migra a planilha sozinha na primeira requisição depois do redeploy, sem precisar editar as colunas na mão. Marcado nas seções com 🆕⁵.
+>
+> **Changelog de IA (substituição do OCR):** a primeira versão do "importar de foto" usava **Tesseract OCR** local (`pytesseract` + `numpy` + heurística de regex) para ler o texto da nota. Isso foi **removido por completo** e trocado pela leitura via API do Google Gemini, que é muito mais precisa (entende o layout da nota, separa itens de linhas de total/imposto, lê fotos tortas) e não exige nada instalado no sistema além do PyQt6 — a chamada HTTP usa só `urllib`. A leitura roda em segundo plano (`SheetsWorker`), sem travar a interface. Se o modelo configurado for desligado pelo Google, a primeira falha `404` dispara `_ia_descobrir_modelo`, que acha um Flash válido na conta e grava no `config.json` automaticamente. Todo nome lido passa por `_nome_apresentavel`, que padroniza como frase — só a primeira letra maiúscula e o resto minúsculo ("ARROZ TIPO 1 5KG" e "Arroz Tipo 1 5kg" viram os dois "Arroz tipo 1 5kg") — pra lista não misturar CAIXA ALTA, Title Case e frase. Por fim, `_consolidar_itens_iguais` junta numa linha só os itens da mesma nota com nome, preço unitário e data idênticos, somando a quantidade — resolve as verduras/carnes vendidas por peso, que a nota lista uma vez por pesagem ("4 brócolis, 5 repolhos") mesmo com o preço do quilo igual.
+>
+> **Changelog de importação por link do QR code:** além da foto, um botão **"🔗 Importar por link"** aceita o endereço do QR code de uma NFC-e. `ler_nota_fiscal_link` baixa a página oficial de consulta da SEFAZ (com um `User-Agent` de navegador), reduz o HTML a texto puro (`_texto_de_html`) e manda para o mesmo modelo, que extrai os itens do texto (dados oficiais e completos). As duas importações compartilham `_ia_gerar_itens` (monta o corpo, faz a chamada, aplica o fallback de modelo) e caem na mesma `ImportarNotaFiscalPage` — quando não há imagem, o painel esquerdo mostra um aviso em vez da foto. Portais que protegem a consulta com CAPTCHA (Santa Catarina, por exemplo) são detectados e o app orienta a usar a foto.
+>
+> **Changelog de segurança e limpeza (🆕⁵, esta revisão):** a URL do Web App do Apps Script — que dá acesso de leitura/escrita à planilha inteira — **saiu do código**: era uma constante hardcoded (e chegou a ser commitada no git). Agora vem de `sheets_webhook_url()` (variável de ambiente `GOOGLE_SHEETS_WEBHOOK_URL` ou `config.json`), e o antigo `ConfigIADialog` virou **`ConfigDialog`**, com um campo pra colar essa URL (segredo, oculto por padrão) além da chave da IA. A leitura por foto deixou de descartar linhas incompletas em silêncio (pede confirmação), e `_inserir_linha_produto` ficou tolerante a valores em branco. A [Seção 20](#20-notas-de-análise--código-morto-bugs-e-segurança) reúne todas as notas de análise, incluindo a recomendação de **rotacionar a URL do Web App** (ela continua no histórico do git já enviado ao GitHub).
 
 ---
 
@@ -30,8 +38,14 @@
 10. [Página 1 — Seleção de empresa](#10-página-1--seleção-de-empresa-companyselectpage)
 11. [Janela principal e navegação](#11-janela-principal-e-navegação-mainwindow)
 12. [Fluxo completo de uma tela até a outra](#12-fluxo-completo-de-uma-tela-até-a-outra)
-13. [Ponto de entrada (`main`)](#13-ponto-de-entrada-main)
+13. [Ponto de entrada (`main`) e tema escuro](#13-ponto-de-entrada-main-e-tema-escuro)
 14. [Backend Apps Script (`apps_script_backend.gs`) 🆕](#14-backend-apps-script-apps_script_backendgs-)
+15. [Campo Nome por compra 🆕⁵](#15-campo-nome-por-compra-)
+16. [Configuração e segredos em disco (`config.json`) 🆕⁵](#16-configuração-e-segredos-em-disco-configjson-)
+17. [Leitura de nota fiscal com IA — foto e link 🆕⁵](#17-leitura-de-nota-fiscal-com-ia--foto-e-link-)
+18. [Diálogo `ConfigDialog` 🆕⁵](#18-diálogo-configdialog-)
+19. [Página de conferência `ImportarNotaFiscalPage` 🆕⁵](#19-página-de-conferência-importarnotafiscalpage-)
+20. [Notas de análise — código morto, bugs e segurança 🆕⁵](#20-notas-de-análise--código-morto-bugs-e-segurança)
 
 ---
 
@@ -47,7 +61,13 @@ O app segue uma ideia parecida com **MVC**, mas simplificada:
 CompanySelectPage  →  ProductListPage  →  ProductEntriesPage
   (escolhe a          (lista os            (mostra/edita as
    empresa)             produtos)            compras do produto)
+                            │
+                            └─ 🆕⁵ ImportarNotaFiscalPage
+                               (confere os itens que a IA leu de uma
+                                nota fiscal, antes de salvar no Sheets)
 ```
+
+🆕⁵ A partir da lista de produtos também dá pra abrir a `ImportarNotaFiscalPage` (mais uma tela do `QStackedWidget`, ver [Seção 19](#19-página-de-conferência-importarnotafiscalpage-)) e o diálogo modal `ConfigDialog` (ver [Seção 18](#18-diálogo-configdialog-)).
 
 Um ponto importante: **nenhuma tela guarda estado permanente sozinha**. Sempre que o usuário volta ou reabre uma tela, o app dispara uma nova busca no Sheets — isso evita mostrar dados desatualizados se a planilha mudou entre uma visita e outra. 🆕 Desde a versão atual, essa busca é precedida por uma leitura instantânea do **cache local** (ver Seção 5), então a tela não fica mais "em branco" enquanto espera a rede.
 
@@ -64,12 +84,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 CACHE_DIR = os.path.join(BASE_DIR, "cache")  # 🆕
 
-GOOGLE_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/.../exec"
+# 🆕⁵ nenhum segredo no código: a URL do Web App e a chave da API vêm do
+# config.json (fora do git) ou de variável de ambiente. Ver Seção 16.
+CONFIG_DIR = os.path.expanduser("~/.config/controle_empresas")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+MODELO_IA_PADRAO = "gemini-2.5-flash"
 ```
 
 - `BASE_DIR` descobre a pasta onde o próprio arquivo `.py` está, e `ASSETS_DIR` aponta para a subpasta `assets/`, onde ficam as logos das empresas. Usar `__file__` em vez de um caminho fixo garante que o app funcione independente de onde ele for executado.
 - 🆕 `CACHE_DIR` aponta para uma subpasta `cache/`, criada automaticamente na primeira vez que o app salva alguma coisa em cache (ver [Seção 5](#5-cache-local-em-disco-)). Ela guarda um arquivo `.json` por empresa.
-- `GOOGLE_SHEETS_WEBHOOK_URL` é a **única "porta de entrada"** do app para os dados. Todo o resto do código depende dessa URL estar configurada corretamente.
+- 🆕⁵ **A URL do Web App do Apps Script não é mais uma constante no código.** Ela dá acesso de leitura/escrita à planilha inteira — é um segredo — e vinha hardcoded (e chegou a ser commitada, ver Seção 20). Agora vem de `sheets_webhook_url()` (variável de ambiente `GOOGLE_SHEETS_WEBHOOK_URL` ou `config.json`), configurável no diálogo "⚙️ Configurar" (ver [Seção 18](#18-diálogo-configdialog-)). Continua sendo a única "porta de entrada" do app para os dados.
+- 🆕⁵ `CONFIG_DIR` / `CONFIG_PATH` apontam para `~/.config/controle_empresas/config.json`, onde ficam a **URL da planilha**, a **chave da API do Google Gemini** e o modelo escolhido — fora da pasta do projeto porque são segredos e não devem entrar no git (ver [Seção 16](#16-configuração-e-segredos-em-disco-configjson-)). `MODELO_IA_PADRAO` é o modelo usado pra ler notas quando o `config.json` não define outro.
 
 ```python
 COMPANIES = [
@@ -85,14 +110,14 @@ Essa lista é o **cadastro de empresas** do app. Cada dicionário descreve como 
 BORDA_COR = "#e8e8e8"
 BORDA_ESPESSURA = 3
 
-COLUNAS_ENTRADAS = ["Data", "Quantidade", "Preço Unitário", "Preço Total"]
-COL_DATA, COL_QTD, COL_PRECO_UNIT, COL_TOTAL = range(4)
+COLUNAS_ENTRADAS = ["Nome", "Data", "Quantidade", "Preço Unitário", "Preço Total"]  # 🆕⁵
+COL_NOME, COL_DATA, COL_QTD, COL_PRECO_UNIT, COL_TOTAL = range(5)
 
 ROWS_INICIAIS = 1
 ```
 
 - `BORDA_COR`/`BORDA_ESPESSURA` são usadas ao desenhar as logos circulares.
-- `COLUNAS_ENTRADAS` define os títulos das colunas da tabela de compras, e as constantes `COL_DATA`, `COL_QTD`, `COL_PRECO_UNIT`, `COL_TOTAL` (0, 1, 2, 3) evitam usar números "mágicos" espalhados pelo código — em vez de `tabela.item(row, 2)`, o código usa `tabela.item(row, COL_PRECO_UNIT)`, o que é bem mais legível.
+- `COLUNAS_ENTRADAS` define os títulos das colunas da tabela de compras, e as constantes `COL_NOME`, `COL_DATA`, `COL_QTD`, `COL_PRECO_UNIT`, `COL_TOTAL` (0, 1, 2, 3, 4) evitam usar números "mágicos" espalhados pelo código — em vez de `tabela.item(row, 3)`, o código usa `tabela.item(row, COL_PRECO_UNIT)`, o que é bem mais legível. 🆕⁵ A coluna **Nome** foi adicionada no início: guarda o texto exato da marca/embalagem daquela compra (ver [Seção 15](#15-campo-nome-por-compra-)); o ID da linha na planilha continua guardado no `UserRole` do item da coluna **Data** (que agora é a coluna 1, não a 0).
 - `ROWS_INICIAIS` é quantas linhas em branco aparecem quando o usuário abre um produto que ainda não tem nenhuma compra registrada. 🆕² Era `3`; passou a ser `1` — o usuário pediu menos ruído visual ao criar um produto novo, e usa "+ Adicionar linha" se precisar de mais.
 
 ---
@@ -193,8 +218,8 @@ Uma exceção customizada. Em vez de deixar erros genéricos do Python (`URLErro
 
 ```python
 def _requisitar(url, dados=None, metodo="GET", timeout=20) -> dict:
-    if not GOOGLE_SHEETS_WEBHOOK_URL:
-        raise ErroSheets("A URL do Google Sheets não foi configurada...")
+    if not url:   # 🆕⁵ agora confere o argumento, não uma constante global
+        raise ErroSheets("A URL da planilha não foi configurada. Abra '⚙️ Configurar'...")
     try:
         requisicao = urllib.request.Request(url, data=dados, headers=..., method=metodo)
         with urllib.request.urlopen(requisicao, timeout=timeout) as resposta:
@@ -219,7 +244,7 @@ def _requisitar(url, dados=None, metodo="GET", timeout=20) -> dict:
 
 É a função "de baixo nível" que todas as outras usam. Passo a passo:
 
-1. **Confere se a URL foi configurada.** Se `GOOGLE_SHEETS_WEBHOOK_URL` estiver vazia, nem tenta fazer a chamada — já avisa o erro de configuração.
+1. **Confere se a URL foi configurada.** 🆕⁵ Cada função pública resolve a URL com `sheets_webhook_url()` e a passa como argumento; se vier vazia (nada no `config.json` nem na variável de ambiente), `_requisitar` nem tenta a chamada — já avisa pra abrir "⚙️ Configurar".
 2. **Monta e envia a requisição HTTP** com `urllib.request` (biblioteca padrão do Python, sem precisar instalar `requests`). O parâmetro `dados` (bytes de um JSON) só é enviado quando é um `POST`; em `GET` ele fica `None`.
 3. **Captura três tipos de falha de rede** separadamente, para dar mensagens de erro mais claras ao usuário: erro HTTP (ex: 500), erro de conexão (ex: sem internet) e erro de timeout/DNS (`OSError`, que às vezes escapa do `URLError`).
 4. **Faz o parse do JSON** da resposta. Se o Apps Script devolver algo que não é JSON válido (por exemplo, uma página de erro HTML do Google, o que acontece quando o script não está publicado corretamente), a função devolve um erro explicando isso, mostrando um trecho da resposta recebida para ajudar a diagnosticar.
@@ -229,8 +254,8 @@ def _requisitar(url, dados=None, metodo="GET", timeout=20) -> dict:
 
 ```python
 def sheets_buscar(empresa: str = None) -> list:
-    url = GOOGLE_SHEETS_WEBHOOK_URL
-    if empresa:
+    url = sheets_webhook_url()   # 🆕⁵
+    if empresa and url:
         url += "?" + urllib.parse.urlencode({"empresa": empresa})
     corpo = _requisitar(url, metodo="GET", timeout=40)
     linhas = corpo.get("linhas", [])
@@ -248,7 +273,7 @@ Faz um `GET` na planilha. Se um nome de empresa for passado, ele é adicionado c
 ```python
 def sheets_salvar(novas: list, existentes: list) -> list:
     payload = json.dumps({"acao": "salvar", "novas": novas, "existentes": existentes}).encode("utf-8")
-    corpo = _requisitar(GOOGLE_SHEETS_WEBHOOK_URL, dados=payload, metodo="POST")
+    corpo = _requisitar(sheets_webhook_url(), dados=payload, metodo="POST")
     return corpo.get("idsNaoEncontrados", [])
 ```
 
@@ -261,10 +286,21 @@ Envia um `POST` com duas listas: `novas` (linhas que ainda não existem na plani
 ```python
 def sheets_remover(ids: list) -> None:
     payload = json.dumps({"acao": "remover", "ids": ids}).encode("utf-8")
-    _requisitar(GOOGLE_SHEETS_WEBHOOK_URL, dados=payload, metodo="POST")
+    _requisitar(sheets_webhook_url(), dados=payload, metodo="POST")
 ```
 
 Envia um `POST` pedindo para apagar as linhas com os IDs informados. O Apps Script apaga a linha de verdade (não deixa célula em branco no meio da planilha).
+
+### 🆕⁵ `sheets_renomear_produtos(itens)`
+
+```python
+def sheets_renomear_produtos(itens: list) -> list:
+    payload = json.dumps({"acao": "renomearProdutos", "itens": itens}).encode("utf-8")
+    corpo = _requisitar(sheets_webhook_url(), dados=payload, metodo="POST")
+    return corpo.get("idsNaoEncontrados", [])
+```
+
+Envia um `POST` com a ação `"renomearProdutos"` (ver [Seção 14](#14-backend-apps-script-apps_script_backendgs-)): cada item de `itens` é um dict com `"id"` e, opcionalmente, `"produto"` e/ou `"nome"` — o backend sobrescreve só a coluna informada, por ID. A ideia é consolidar num só lugar produtos parecidos que viraram pastas separadas. **Nenhuma tela chama essa função ainda** — a ferramenta de mesclagem na interface não foi construída; por enquanto o código é só o "encanamento" pronto pra ela (ver notas de análise no fim da revisão).
 
 ### `SheetsWorker` (a ponte com a interface)
 
@@ -282,13 +318,13 @@ class SheetsWorker(QThread):
         try:
             resultado = self._funcao(*self._args, **self._kwargs)
             self.concluido.emit(True, resultado)
-        except ErroSheets as e:
+        except (ErroSheets, ErroIA) as e:   # 🆕⁵ ErroIA
             self.concluido.emit(False, str(e))
         except Exception as e:
             self.concluido.emit(False, f"Erro inesperado: {e}")
 ```
 
-Essa classe é o que **evita que a janela trave** enquanto o app fala com o Google. Ela é uma `QThread` "genérica": recebe qualquer uma das três funções acima (`sheets_buscar`, `sheets_salvar` ou `sheets_remover`) mais seus argumentos, e as executa numa thread separada quando `.start()` é chamado.
+Essa classe é o que **evita que a janela trave** enquanto o app fala com o Google. Ela é uma `QThread` "genérica": recebe qualquer função de rede pura mais seus argumentos, e a executa numa thread separada quando `.start()` é chamado. 🆕⁵ Além de `sheets_buscar` / `sheets_salvar` / `sheets_remover`, ela também roda `ler_nota_fiscal_ia` e `ler_nota_fiscal_link` (ver [Seção 17](#17-leitura-de-nota-fiscal-com-ia--foto-e-link-)) — por isso o `except` agora captura também `ErroIA`, a exceção da leitura de notas, e a repassa como mensagem de erro em vez de deixá-la virar um "Erro inesperado".
 
 Quando termina (`run()`), ela emite o sinal `concluido` com dois valores:
 - `True, resultado` se deu certo (o `resultado` é o que a função devolveu — ex: a lista de linhas);
@@ -438,7 +474,7 @@ class TabelaComNavegacaoEnter(QTableWidget):
         row, col = self.currentRow(), self.currentColumn()
         super().closeEditor(editor, QAbstractItemDelegate.EndEditHint.NoHint)
 
-        proxima_coluna = {COL_DATA: COL_QTD, COL_QTD: COL_PRECO_UNIT}.get(col)
+        proxima_coluna = {COL_NOME: COL_DATA, COL_DATA: COL_QTD, COL_QTD: COL_PRECO_UNIT}.get(col)  # 🆕⁵
         if proxima_coluna is None:
             return
 
@@ -448,6 +484,7 @@ class TabelaComNavegacaoEnter(QTableWidget):
 
 Ao confirmar uma célula em edição, o Qt avisa a view **qual tecla motivou o fechamento** através de um "hint" entregue ao método `closeEditor`. Essa subclasse intercepta esse hint especificamente quando ele indica que foi o **Enter/Return** que fechou o editor: em vez de deixar o comportamento padrão (que apenas confirma o valor, sem mover o cursor), ela fecha o editor manualmente (`NoHint`) e decide o próximo passo, seguindo o fluxo de preenchimento de uma compra:
 
+- 🆕⁵ Na coluna **Nome**, Enter abre a edição da célula **Data** da mesma linha.
 - Na coluna **Data**, Enter abre a edição da célula **Quantidade** da mesma linha.
 - Na coluna **Quantidade**, Enter abre a edição da célula **Preço Unitário** da mesma linha.
 - Na coluna **Preço Unitário**, o dicionário `proxima_coluna` não tem uma entrada correspondente (`.get()` devolve `None`), então a função simplesmente retorna — o valor já foi confirmado, mas o cursor **não avança e nenhuma linha nova é criada**. (A coluna Total nunca entra nesse fluxo por ser somente leitura.)
@@ -540,7 +577,7 @@ def _definir_ocupado(self, ocupado: bool, mensagem: str = ""):
 Monta, de cima para baixo:
 1. **Linha de título** (`_criar_linha_titulo`) — botão "Voltar" (guardado como `self.btn_voltar` 🆕, em vez de variável local, para poder ser desabilitado por `_definir_ocupado`; 🆕² agora chama `_tentar_voltar` em vez do `voltar_callback` direto, ver abaixo), indicadores de melhor/pior compra, o mini gráfico, e o título "Empresa › Produto" centralizado — 🆕² agora um `LabelElidavel` em vez de `QLabel` comum, pra não desalinhar a tela quando o nome do produto é muito grande (ver [Seção 7](#7-mini-gráfico-de-tendência-de-preço)). Um `QLabel` vazio à direita (`espacador`) equilibra visualmente o bloco da esquerda, mantendo o título realmente centralizado.
 2. **Linha de filtro por data** (`_criar_linha_filtro`) — dois `QDateEdit` ("De" / "Até") e os botões "Filtrar" / "Limpar filtro".
-3. **A tabela de compras** — 🆕² agora uma `TabelaComNavegacaoEnter` (ver [Seção 7](#7-mini-gráfico-de-tendência-de-preço)) em vez de `QTableWidget` puro, com 4 colunas (`COLUNAS_ENTRADAS`) e cabeçalho pintado na cor da empresa. Ela escuta `itemChanged` (`self.tabela.itemChanged.connect(self._on_item_changed)`).
+3. **A tabela de compras** — 🆕² agora uma `TabelaComNavegacaoEnter` (ver [Seção 7](#7-mini-gráfico-de-tendência-de-preço)) em vez de `QTableWidget` puro, com 🆕⁵ 5 colunas (`COLUNAS_ENTRADAS` = Nome, Data, Quantidade, Preço Unitário, Preço Total — a coluna **Nome** entrou no início, ver [Seção 15](#15-campo-nome-por-compra-)) e cabeçalho pintado na cor da empresa. Ela escuta `itemChanged` (`self.tabela.itemChanged.connect(self._on_item_changed)`).
 4. **Label de total do produto**.
 5. **Linha de botões** (`_criar_linha_botoes`) — Adicionar linha / Remover linha / Recarregar do Sheets / Salvar.
 6. **Label de status**, que mostra mensagens de sucesso (verde) ou erro (vermelho) das operações.
@@ -568,6 +605,7 @@ def _snapshot_linha(self, row: int) -> dict:
     item_data = self.tabela.item(row, COL_DATA)
     return {
         "id": self._id_da_linha(row),
+        "nome": self._texto_celula(row, COL_NOME),  # 🆕⁵
         "data": self._texto_celula(row, COL_DATA),
         "quantidade": qtd_txt,
         "preco_unitario": preco_txt,
@@ -625,7 +663,7 @@ O botão "← Voltar" não chama mais `voltar_callback` diretamente — ele pass
 
 1. Recusa começar se `_operacao_em_andamento` ou `_remocoes_em_andamento > 0` (🆕⁴ — uma remoção em andamento pode deslocar os números de linha que este salvamento está prestes a usar).
 2. Percorre todas as linhas da tabela, ignorando qualquer uma com quantidade ou preço inválido/zerado (linhas em branco não são enviadas).
-3. Para cada linha válida **e ou nova ou marcada como editada** (`self._itens_editados` — ver abaixo), monta um dicionário `registro` com `data`, `quantidade`, `preco_unitario`, `preco_total`.
+3. Para cada linha válida **e ou nova ou marcada como editada** (`self._itens_editados` — ver abaixo), monta um dicionário `registro` com `nome` 🆕⁵, `data`, `quantidade`, `preco_unitario`, `preco_total`.
 4. Se a linha já tiver um ID (via `_id_da_linha`), ela é uma **atualização** → vai para a lista `existentes`. Senão, gera um novo ID (`gerar_id`), adiciona `empresa`/`produto` ao registro (necessário para o Sheets saber onde inserir) e vai para a lista `novas`. Também guarda, em `linhas_por_id_novo`, qual linha da tabela corresponde a cada novo ID, e em `itens_enviados` o `id()` de cada linha realmente incluída no envio.
 5. Se não houver nada pra enviar, apenas avisa e para.
 6. Caso contrário, dispara `_disparar_worker(sheets_salvar, novas, existentes, ...)`.
@@ -752,6 +790,18 @@ Junta produtos "reais" (do Sheets) com produtos "pendentes" (criados nesta sess�
 
 Para cada produto, busca a última compra com `obter_ultima_compra` e mostra sua data e valor. A célula na última coluna não é um texto — é um **botão** (`QPushButton("Abrir lista →")`) inserido com `setCellWidget`, que ao ser clicado chama `_abrir_produto(nome_produto)`. Um duplo clique em qualquer célula da linha também abre o produto (via `itemDoubleClicked`). 🆕² A célula com o nome do produto (`item_nome`) agora também recebe um `setToolTip(nome_produto)`, mostrando o nome completo ao passar o mouse quando ele é grande demais para a coluna.
 
+### 🆕⁵ Importar nota fiscal e configurar a IA
+
+A barra de botões dessa página ganhou três botões ligados à leitura de notas por IA:
+
+- **`📷 Importar nota fiscal`** (`_importar_de_foto`) — chama `_garantir_ia_configurada()` (se ainda não há chave da API, oferece abrir o diálogo de configuração), abre um `QFileDialog` pra escolher a foto, e dispara `ler_nota_fiscal_ia` num `SheetsWorker` (ver [Seção 17](#17-leitura-de-nota-fiscal-com-ia--foto-e-link-)). O resultado cai em `_on_leitura_ia`.
+- **`🔗 Importar por link`** (`_importar_por_link`) — mesma ideia, mas pede o endereço do QR code da NFC-e num `QInputDialog` e dispara `ler_nota_fiscal_link`.
+- **`⚙️ Configurar`** (`_configurar_ia`) — abre o `ConfigDialog` (ver [Seção 18](#18-diálogo-configdialog-)).
+
+`_on_leitura_ia(sucesso, resultado, origem)` é o callback comum das duas importações. Em caso de erro, mostra um `QMessageBox.critical`. Em caso de sucesso, monta a lista de pastas (produtos) já existentes daquela empresa e chama `abrir_importar_foto_callback` — que a `MainWindow` liga à criação de uma `ImportarNotaFiscalPage` (ver [Seção 19](#19-página-de-conferência-importarnotafiscalpage-)). Se a IA não reconheceu nenhum item, um aviso explica que dá pra abrir a tela de conferência mesmo assim e digitar os itens na mão. `origem` é o caminho da imagem (ou `""` quando veio de link), usado pela página de conferência pra decidir se mostra a foto ou um aviso.
+
+`_definir_ocupado` dessa página desabilita também os três botões acima enquanto uma leitura está em andamento.
+
 ### Adicionar e remover produtos
 
 - **`_adicionar_produto`**: abre um `QInputDialog` pedindo o nome, valida que não é vazio nem duplicado, e adiciona à lista `_produtos_pendentes`. 🆕² Em seguida chama `self._abrir_produto(nome)` — o produto recém-criado é aberto na hora, direto na tela de compras, sem o usuário precisar localizá-lo na lista (que pode estar ordenada ou filtrada de um jeito que o esconda).
@@ -763,7 +813,7 @@ Para cada produto, busca a última compra com `obter_ultima_compra` e mostra sua
 
 A tela mais simples: para cada empresa em `COMPANIES`, cria um "card" vertical com o avatar circular (via `criar_avatar_circular`) e um botão colorido com o nome da empresa, que ao ser clicado chama `escolher_callback(empresa)`.
 
-Se `GOOGLE_SHEETS_WEBHOOK_URL` estiver vazia, mostra um aviso vermelho no topo, para deixar claro que o app não vai funcionar sem essa configuração — em vez de o usuário só descobrir isso depois, ao tentar abrir uma empresa e receber um erro confuso.
+🆕⁵ Se `sheets_webhook_url()` vier vazia (nada configurado), mostra um aviso vermelho no topo orientando a abrir uma empresa e clicar em "⚙️ Configurar" — em vez de o usuário só descobrir isso depois, ao tentar abrir uma empresa e receber um erro confuso.
 
 ---
 
@@ -864,12 +914,13 @@ Um resumo visual de tudo o que foi explicado, seguindo o caminho de "abrir a emp
 
 ---
 
-## 13. Ponto de entrada (`main`)
+## 13. Ponto de entrada (`main`) e tema escuro
 
 ```python
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    aplicar_tema_escuro(app)   # 🆕⁵
     janela = MainWindow()
     janela.show()
     sys.exit(app.exec())
@@ -881,6 +932,7 @@ if __name__ == "__main__":
 
 - `QApplication(sys.argv)` inicializa o motor do Qt — é obrigatório existir exatamente uma instância dessa classe antes de criar qualquer widget.
 - `app.setStyle("Fusion")` aplica um tema visual consistente entre Windows e Linux (em vez do estilo nativo de cada sistema operacional, que varia bastante).
+- 🆕⁵ `aplicar_tema_escuro(app)` monta um `QPalette` escuro fixo (janela, base das tabelas, texto, botões, seleção, além das cores do grupo `Disabled`) e aplica com `app.setPalette(...)`. O objetivo é o app ficar **sempre** com o mesmo visual escuro, independente do tema (claro/escuro) do sistema ou do ambiente onde for executado — antes, num sistema em tema claro, os campos ficavam com texto claro sobre fundo claro em alguns lugares. As cores de destaque de cada empresa (cabeçalhos de tabela, botões primários) continuam vindo de `COMPANIES`, por cima dessa paleta.
 - `janela.show()` exibe a `MainWindow` (que por sua vez mostra a `CompanySelectPage`, a primeira tela do `QStackedWidget`).
 - `app.exec()` inicia o **loop de eventos** do Qt — é essa chamada que mantém o app "vivo", escutando cliques, digitação e os sinais dos `SheetsWorker`, até a janela ser fechada. `sys.exit(...)` garante que o código de saída do processo reflita como o Qt encerrou.
 
@@ -893,10 +945,33 @@ Esse arquivo roda **dentro do Google**, ligado à planilha (Extensões → Apps 
 ### Estrutura da planilha
 
 ```
-ID | Empresa | Produto | Data | Quantidade | Preço Unitário | Preço Total
+ID | Empresa | Produto | Nome | Data | Quantidade | Preço Unitário | Preço Total
 ```
 
-🆕 O array `CABECALHO` foi corrigido para refletir essas 7 colunas de verdade — na versão anterior ele só listava 5 nomes, o que não batia com o que era realmente gravado.
+🆕 O array `CABECALHO` foi corrigido para refletir as colunas de verdade — uma versão antiga listava só 5 nomes, o que não batia com o que era realmente gravado.
+
+🆕⁵ A coluna **Nome** (posição 4, logo depois de "Produto") foi adicionada: "Produto" é a **pasta/tipo** (ex: "Aveia Flocos") e "Nome" é o texto da **marca/embalagem daquela compra** (ex: "Aveia Flocos Marca X") — ver [Seção 15](#15-campo-nome-por-compra-). `NUM_COLUNAS` passou a ser 8. Planilhas criadas antes dessa coluna são migradas sozinhas por `garantirColunaNome` (abaixo).
+
+### 🆕⁵ `garantirColunaNome(planilha)` — migração automática da coluna Nome
+
+```javascript
+function garantirColunaNome(planilha) {
+  var props = PropertiesService.getScriptProperties();
+  var chave = "COLUNA_NOME_ADICIONADA_" + planilha.getSheetId();
+  if (props.getProperty(chave) === "1") return;
+
+  var larguraCabecalho = Math.max(planilha.getLastColumn(), 1);
+  var cabecalhoAtual = planilha.getRange(1, 1, 1, larguraCabecalho).getValues()[0];
+  if (cabecalhoAtual.indexOf("Nome") === -1) {
+    planilha.insertColumnBefore(4);       // coluna D: antes da antiga "Data"
+    planilha.getRange(1, 4).setValue("Nome");
+    props.deleteProperty("FORMATO_TEXTO_APLICADO_" + planilha.getSheetId());
+  }
+  props.setProperty(chave, "1");
+}
+```
+
+Chamada dentro de `getPlanilha()`, antes de `garantirFormatoTexto`. Planilhas antigas têm o cabeçalho `ID | Empresa | Produto | Data | ...` (sem "Nome"). A função detecta isso (`indexOf("Nome") === -1`) e usa `insertColumnBefore(4)` pra abrir uma coluna vazia na posição D, empurrando Data/Quantidade/Preço Unitário/Preço Total uma coluna pra direita **sem perder nenhum dado** (o `insertColumnBefore` desloca o conteúdo das células, não apaga). Como a coluna Data saiu de D pra E, a função também apaga a Script Property `FORMATO_TEXTO_APLICADO_...` pra `garantirFormatoTexto` rodar de novo e reaplicar o formato de texto puro na coluna certa. Roda uma única vez por aba (controlada pela Script Property `COLUNA_NOME_ADICIONADA_<sheetId>`).
 
 ### 🆕⁴ `getPlanilha()` — presa numa aba fixa, não na aba "ativa"
 
@@ -923,6 +998,7 @@ function getPlanilha() {
   if (planilha.getLastRow() === 0) {
     planilha.appendRow(CABECALHO);
   }
+  garantirColunaNome(planilha);   // 🆕⁵ migra planilhas antigas (ver acima)
   garantirFormatoTexto(planilha);
   return planilha;
 }
@@ -940,7 +1016,7 @@ function garantirFormatoTexto(planilha) {
   var chave = "FORMATO_TEXTO_APLICADO_" + planilha.getSheetId();
   if (props.getProperty(chave) === "1") return;
   planilha.getRange("A:A").setNumberFormat("@"); // ID
-  planilha.getRange("D:D").setNumberFormat("@"); // Data
+  planilha.getRange("E:E").setNumberFormat("@"); // 🆕⁵ Data (era D; virou E com a coluna "Nome")
   props.setProperty(chave, "1");
 }
 ```
@@ -950,7 +1026,7 @@ O Google Sheets "adivinha" o tipo de uma célula pelo que parece ter sido digita
 - Um **ID** gerado por `gerar_id()` (hexadecimal: `0-9` e `a-f`) que, por acaso, só tivesse dígitos (ex: `"012345678901"`) podia ser convertido pro **número** `12345678901` — perdendo o zero à esquerda. Da próxima vez que o app tentasse editar/remover essa linha usando o ID original (com o zero), a busca no índice (`construirIndiceIds`) nunca batia, e a operação era silenciosamente ignorada.
 - Uma **Data** enviada como texto (`"10/08/2026"`) podia virar uma data de verdade — o que trazia o bug de fuso horário explicado logo abaixo.
 
-A correção formata as colunas **A** (ID) e **D** (Data) como **texto puro** (`"@"`) assim que a aba é preparada, então o Sheets nunca mais tenta "converter" nada escrito nelas — o texto exato que o app manda é o texto exato que fica gravado. Roda só uma vez por aba (controlado por outra Script Property), então não pesa nas chamadas seguintes.
+A correção formata as colunas **A** (ID) e **E** (Data — 🆕⁵ era a **D** antes da coluna "Nome" existir) como **texto puro** (`"@"`) assim que a aba é preparada, então o Sheets nunca mais tenta "converter" nada escrito nelas — o texto exato que o app manda é o texto exato que fica gravado. Roda só uma vez por aba (controlado por outra Script Property), então não pesa nas chamadas seguintes.
 
 ### 🆕⁴ `normalizarDataLida(valor)` — corrige mesmo linhas já convertidas antes dessa correção
 
@@ -970,7 +1046,7 @@ A correção detecta esse caso (`Object.prototype.toString.call(valor) === "[obj
 
 ### `lerTodasLinhasDaPlanilha()`
 
-Lê a planilha inteira **de uma vez** (`getDataRange().getValues()`) e converte cada linha num objeto JS `{id, empresa, produto, data, quantidade, preco_unitario, preco_total}`, pulando linhas sem ID (vazias). 🆕⁴ `id` agora sempre passa por `String(...)` (nunca deixa um ID todo numérico virar `Number` na resposta) e `data` passa por `normalizarDataLida` (explicado acima).
+Lê a planilha inteira **de uma vez** (`getDataRange().getValues()`) e converte cada linha num objeto JS `{id, empresa, produto, nome, data, quantidade, preco_unitario, preco_total}` 🆕⁵ (o campo `nome` vem de `linha[3]`, e `data`/`quantidade`/`preco_unitario`/`preco_total` passaram de `linha[3..6]` pra `linha[4..7]`), pulando linhas sem ID (vazias). 🆕⁴ `id` agora sempre passa por `String(...)` (nunca deixa um ID todo numérico virar `Number` na resposta) e `data` passa por `normalizarDataLida` (explicado acima).
 
 ### 🆕 Cache de leitura (`cacheSalvarLista` / `cacheCarregarLista` / `invalidarCache`)
 
@@ -1068,7 +1144,7 @@ function salvarRegistros(planilha, novas, existentes) {
   if (novas.length > 0) {
     var linhaInicial = planilha.getLastRow() + 1;
     var dados = novas.map(function (l) {
-      return [l.id, l.empresa, l.produto, l.data, l.quantidade, l.preco_unitario, l.preco_total];
+      return [l.id, l.empresa, l.produto, l.nome, l.data, l.quantidade, l.preco_unitario, l.preco_total];  // 🆕⁵ l.nome
     });
     planilha.getRange(linhaInicial, 1, dados.length, NUM_COLUNAS).setValues(dados);
   }
@@ -1098,7 +1174,7 @@ function salvarRegistros(planilha, novas, existentes) {
 
 🆕⁴ **`idsNaoEncontrados` — parar de descartar edições em silêncio.** Antes, um `existentes.map(...).filter(...)` simplesmente **descartava** qualquer linha cujo ID não estivesse no índice (por exemplo, apagada por outra sessão entre o usuário editar e clicar Salvar) — e `doPost` respondia `{ ok: true }` do mesmo jeito, como se tudo tivesse sido salvo. Agora `salvarRegistros` separa esses casos em `idsNaoEncontrados` e devolve essa lista; `doPost` repassa ela na resposta (`{ ok: true, idsNaoEncontrados: [...] }`), e o Python (`ProductEntriesPage._on_salvamento_concluido`, ver [Seção 8](#8-página-3--compras-de-um-produto-producteentriespage)) usa essa informação pra manter essas linhas específicas marcadas como pendentes, em vez de assumir que está tudo salvo.
 
-Pra **várias** linhas existentes editadas na mesma chamada, em vez de uma `setValues()` por linha, o código lê o bloco do menor ao maior número de linha de uma vez, atualiza só as linhas alvo em memória, e grava tudo de volta com um único `setValues()` — trocamos ler/escrever algumas células a mais (as linhas do meio que não mudaram) por bem menos chamadas à planilha, que é o que realmente pesa no tempo de resposta. Pra uma linha só (o caso mais comum), grava direto, sem essa leitura extra.
+Pra **várias** linhas existentes editadas na mesma chamada, em vez de uma `setValues()` por linha, o código lê o bloco do menor ao maior número de linha de uma vez, atualiza só as linhas alvo em memória, e grava tudo de volta com um único `setValues()` — trocamos ler/escrever algumas células a mais (as linhas do meio que não mudaram) por bem menos chamadas à planilha, que é o que realmente pesa no tempo de resposta. Pra uma linha só (o caso mais comum), grava direto, sem essa leitura extra. 🆕⁵ Em ambos os casos, o intervalo escrito começa na coluna 4 e agora tem **5 colunas** (`Nome`, `Data`, `Quantidade`, `Preço Unitário`, `Preço Total`) — era 4 antes da coluna "Nome".
 
 ```javascript
 function removerRegistros(planilha, ids) {
@@ -1130,7 +1206,243 @@ function removerRegistros(planilha, ids) {
 
 Mesma lógica de índice único, mas com um cuidado a mais: linhas **vizinhas** na planilha (números consecutivos, comum quando um produto teve todas as suas compras salvas de uma vez) são agrupadas num único `deleteRows(inicio, quantidade)`, em vez de um `deleteRow()` por linha — menos chamadas à planilha quando é possível, sem mudar o resultado (a remoção continua acontecendo de baixo para cima, pra não bagunçar os índices das linhas seguintes).
 
-Por fim, `doPost` chama `invalidarCache()` depois de qualquer `salvar` ou `remover` bem-sucedido, garantindo que a próxima leitura (`doGet`) já reflita os dados novos, em vez de servir uma versão em cache desatualizada.
+### 🆕⁵ `renomearProdutos(planilha, itens)` — ação `"renomearProdutos"` do `doPost`
+
+```javascript
+function renomearProdutos(planilha, itens) {
+  var idsNaoEncontrados = [];
+  if (!itens.length) return { idsNaoEncontrados: idsNaoEncontrados };
+
+  var indice = construirIndiceIds(planilha); // uma única leitura, não uma por item
+  itens.forEach(function (item) {
+    var linha = indice[String(item.id)];
+    if (!linha) { idsNaoEncontrados.push(item.id); return; }
+    if (item.produto !== undefined) planilha.getRange(linha, 3).setValue(item.produto);
+    if (item.nome !== undefined)    planilha.getRange(linha, 4).setValue(item.nome);
+  });
+  return { idsNaoEncontrados: idsNaoEncontrados };
+}
+```
+
+Renomeia, por ID, a **pasta** (coluna 3, "Produto") e/ou o **nome** (coluna 4, "Nome") de linhas já salvas — só a coluna informada em cada item é sobrescrita. Serve pra consolidar produtos parecidos que viraram pastas separadas por engano (ex: "Vinho pergola" e "Vinho randon" → pasta "Vinho", com a marca guardada no Nome de cada linha). Usa `construirIndiceIds` uma vez só, como as outras operações de escrita. `doPost` trata a ação `"renomearProdutos"`, chama `invalidarCache()` e responde `{ ok: true, idsNaoEncontrados: [...] }`.
+
+> ⚠️ **Estado atual:** o backend implementa isso por completo, e há a função `sheets_renomear_produtos` no Python (Seção 4), **mas nenhuma tela do app chama essa função** — a "ferramenta de mesclagem/migração" mencionada ainda não foi construída na interface. Ver as notas de análise no final da revisão.
+
+Por fim, `doPost` chama `invalidarCache()` depois de qualquer `salvar`, `remover` ou `renomearProdutos` bem-sucedido, garantindo que a próxima leitura (`doGet`) já reflita os dados novos, em vez de servir uma versão em cache desatualizada.
+
+---
+
+## 15. Campo Nome por compra 🆕⁵
+
+Antes, um "produto" era uma coisa só: a pasta **e** o nome da compra eram o mesmo texto. Isso obrigava a criar uma pasta separada pra cada marca ("Vinho Pergola", "Vinho Randon", "Vinho Miolo"...), poluindo a lista.
+
+Agora há dois níveis:
+
+| Conceito | Onde mora | Exemplo |
+|---|---|---|
+| **Pasta / tipo de produto** | coluna "Produto" no Sheets; chave de `_linhas_por_produto`; título das telas | `Aveia Flocos` |
+| **Nome da compra** | 🆕⁵ coluna "Nome" no Sheets; `COL_NOME` na tabela de compras | `Aveia Flocos Marca X 500g` |
+
+Cada linha da tabela de compras (`ProductEntriesPage`) tem seu próprio Nome, editável como qualquer outra célula. `_adicionar_linha` cria o `QTableWidgetItem` da coluna `COL_NOME`; `_snapshot_linha`, `_salvar` e o backend (`salvarRegistros`, `lerTodasLinhasDaPlanilha`) carregam o campo `nome` junto com data/quantidade/preço. A navegação por Enter começa em Nome (ver [Seção 7](#7-mini-gráfico-de-tendência-de-preço)). Quem só quer registrar uma compra rápida pode deixar o Nome em branco — ele não é obrigatório pra salvar (só pasta, quantidade e preço são).
+
+O ID da linha na planilha continua guardado no `UserRole` do item da **coluna Data** — como Data virou a coluna 1 (era a 0), toda referência a essa identidade no código usa a constante `COL_DATA`, então a mudança de índice foi transparente.
+
+---
+
+## 16. Configuração e segredos em disco (`config.json`) 🆕⁵
+
+A leitura de notas por IA precisa de uma **chave da API do Google Gemini**, que é um segredo — não pode ficar no código nem no git. Ela vive em `~/.config/controle_empresas/config.json`, com estas funções cuidando do arquivo:
+
+### `carregar_config()` / `salvar_config(dados)`
+
+```python
+def carregar_config() -> dict:
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+        return dados if isinstance(dados, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def salvar_config(dados: dict) -> None:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as arquivo:
+        json.dump(dados, arquivo, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+```
+
+- `carregar_config` nunca levanta exceção: se o arquivo não existe, está corrompido ou é um JSON que não é objeto, devolve `{}` — nesse caso o app abre mas não carrega nenhuma empresa até a URL da planilha ser configurada.
+- `salvar_config` grava com **permissão `600`** (só o dono lê), pra os segredos (URL da planilha e chave da API) não ficarem legíveis pra outros usuários da máquina. Em sistemas de arquivos sem permissões POSIX (pen drive, etc.) o `chmod` falha silenciosamente e o app segue.
+
+Chaves gravadas no `config.json`: `sheets_webhook_url`, `gemini_api_key`, `gemini_modelo`.
+
+### `sheets_webhook_url()` / `ia_api_key()` / `ia_modelo()`
+
+```python
+def sheets_webhook_url() -> str:   # 🆕⁵
+    return (os.environ.get("GOOGLE_SHEETS_WEBHOOK_URL")
+            or carregar_config().get("sheets_webhook_url") or "").strip()
+
+def ia_api_key() -> str:
+    return (os.environ.get("GEMINI_API_KEY") or carregar_config().get("gemini_api_key") or "").strip()
+
+def ia_modelo() -> str:
+    return (carregar_config().get("gemini_modelo") or "").strip() or MODELO_IA_PADRAO
+```
+
+Os dois "resolvedores" de segredo seguem o mesmo padrão: **variável de ambiente primeiro** (`GOOGLE_SHEETS_WEBHOOK_URL` / `GEMINI_API_KEY` — útil pra CI, contêiner, ou pra quem não quer gravar nada em disco), `config.json` depois, e `""` se não houver nenhum. `ia_modelo` usa o modelo salvo, ou `MODELO_IA_PADRAO` (`"gemini-2.5-flash"`) se nada estiver configurado.
+
+🆕⁵ `sheets_webhook_url()` substituiu a antiga constante `GOOGLE_SHEETS_WEBHOOK_URL` hardcoded no topo do arquivo — que é um segredo (dá acesso total à planilha) e não pode ficar no código nem no git.
+
+---
+
+## 17. Leitura de nota fiscal com IA — foto e link 🆕⁵
+
+Esse bloco substituiu por completo o antigo OCR local (Tesseract + numpy + regex). Agora a imagem — ou o texto da página da SEFAZ — vai direto pra **API do Google Gemini**, que devolve os itens já estruturados. Roda sempre dentro de um `SheetsWorker` (thread), então a interface não trava.
+
+### `ErroIA`
+
+Exceção única de todo esse bloco (chave ausente/recusada, rede fora, modelo inexistente, limite de uso, resposta inesperada). O `SheetsWorker` captura `ErroIA` junto com `ErroSheets` (ver [Seção 4](#4-integração-com-o-google-sheets)).
+
+### `_ia_requisitar(url, dados, timeout, api_key)`
+
+O "cliente HTTP" do Gemini: `POST` (quando há `dados`) ou `GET`, com a chave no cabeçalho `x-goog-api-key`. Traduz cada falha pra uma `ErroIA` com mensagem em português:
+
+| HTTP | Mensagem |
+|---|---|
+| 401 / 403 / "api key" no corpo | "A chave da API foi recusada pelo Google… Confira em '⚙️ Configurar'." |
+| 404 | "O modelo '…' não existe ou não está liberado pra sua chave." |
+| 429 | "Limite de uso da API do Gemini atingido. Espere alguns minutos…" |
+| outros | "O Google respondeu com erro HTTP …" |
+
+O parâmetro `api_key` permite **testar uma chave que ainda não foi salva** (usado pelo `ConfigDialog` ao clicar em "Buscar modelos").
+
+### `ler_nota_fiscal_ia(caminho_imagem)`
+
+Valida que há chave configurada, lê os bytes da imagem, recusa arquivo vazio ou acima de ~18 MB (`_IA_LIMITE_IMAGEM` — a API aceita ~20 MB contando o base64), descobre o MIME pela extensão (`_IA_MIMES`; cai em `image/jpeg` se não reconhecer) e chama `_ia_gerar_itens` com duas partes: a imagem em base64 (`inline_data`) e o prompt `_IA_PROMPT_NOTA`.
+
+### `ler_nota_fiscal_link(url)`
+
+Para NFC-e: a nota traz um QR code que aponta pra página oficial de consulta da SEFAZ, com **todos os itens e preços exatos** — mais confiável que ler a foto. A função:
+
+1. valida que a URL começa com `http://`/`https://`;
+2. baixa a página com um `User-Agent` de navegador (alguns portais bloqueiam clientes "estranhos"), lendo no máximo 4 MB;
+3. reduz o HTML a texto puro com `_texto_de_html` (tira `<script>`/`<style>`/`<noscript>`, remove todas as tags, desescapa entidades, colapsa espaços);
+4. se o texto vier muito curto **e** contiver palavras de tela de CAPTCHA/"não sou um robô"/"habilite o javascript", levanta `ErroIA` explicando que aquele estado (Santa Catarina, por exemplo) protege a consulta com um desafio que o app não passa — e que a saída é a importação por foto;
+5. corta o texto em 60,000 caracteres e chama `_ia_gerar_itens` com o prompt `_IA_PROMPT_LINK` + o texto.
+
+### `_ia_gerar_itens(parts)` — a chamada, com fallback de modelo
+
+Monta o corpo com `responseMimeType: "application/json"`, `responseSchema: _IA_SCHEMA_NOTA` (força o formato `{itens: [{nome, data, quantidade, preco_unitario}]}`) e `temperature: 0`. Chama `_ia_requisitar` no modelo configurado.
+
+🆕⁵ **Se a chamada falhar com "modelo não existe" (404)** — o Google desligou o modelo, ou o `MODELO_IA_PADRAO` embutido ficou velho — `_ia_descobrir_modelo()` acha um Flash válido na conta, grava no `config.json` e a chamada é refeita **uma vez**, com o modelo novo. Qualquer outro erro (rede, 429, 500) é repassado sem mexer no config — a checagem de "não existe" acontece **antes** de `_ia_descobrir_modelo` para um limite de uso passageiro não trocar a escolha de modelo do usuário à toa (bug corrigido nesta revisão).
+
+### `_ia_descobrir_modelo()`
+
+Chama `listar_modelos_ia()`, escolhe o primeiro nome que tenha `flash` e não tenha `lite`/`image`/`thinking` (ou qualquer `flash`, ou o primeiro modelo da lista como último recurso), grava em `config["gemini_modelo"]` e devolve o nome. Devolve `""` se a listagem também falhar.
+
+### `_ia_itens_da_resposta(dados)`
+
+Extrai o JSON de dentro da resposta do Gemini, com mensagens específicas pra cada modo de falha: nenhum candidato (+ `blockReason` se o conteúdo foi bloqueado), texto vazio com `finishReason == "MAX_TOKENS"` ("a nota tem itens demais pra uma leitura só"), JSON inválido, etc. Para cada item cru, monta um dict com:
+
+- `nome` → `_nome_apresentavel(nome)` (padroniza como frase — ver abaixo);
+- `data` → `_ia_normalizar_data(...)` (aceita `dd/mm/aaaa`, `aaaa-mm-dd`, `dd/mm/aa`; devolve sempre `dd/MM/yyyy` ou `""`);
+- `quantidade` / `preco_unitario` → `_ia_para_numero(valor, padrao)` (aceita vírgula ou ponto; devolve o padrão se ≤ 0 ou inválido).
+
+Itens sem nome são descartados. No fim, passa a lista por `_consolidar_itens_iguais`.
+
+### `_nome_apresentavel(texto)`
+
+```python
+def _nome_apresentavel(texto: str) -> str:
+    return re.sub(r"\s+", " ", texto).strip().capitalize()
+```
+
+Colapsa espaços e devolve o texto como **frase**: só a primeira letra maiúscula, todo o resto minúsculo. Nota fiscal quase sempre vem em CAIXA ALTA (`ARROZ TIPO 1 5KG`) e a IA às vezes devolve em Title Case (`Arroz Tipo 1 5kg`) — os dois viram `Arroz tipo 1 5kg`, pra a lista não misturar três estilos de capitalização. Efeito colateral aceito: marcas com maiúscula interna (`Coca-Cola`, `iPhone`) também são rebaixadas; o docstring da função marca onde adicionar exceções se algum dia incomodar.
+
+> Histórico: uma versão anterior só corrigia quando o texto era "predominantemente maiúsculo" e deixava o Title Case passar — o que fazia nomes subirem pro Sheets com capitalização inconsistente. Passou a ser incondicional a pedido do usuário.
+
+### `_consolidar_itens_iguais(itens)`
+
+Junta numa linha só os itens da **mesma nota** com nome, preço unitário (arredondado a 2 casas) e data idênticos, **somando a quantidade**. Resolve verduras e carnes vendidas por peso: a nota lista uma linha por pesagem ("4 unidades de brócolis, 5 de repolho"), mas como o preço do quilo é o mesmo, o que interessa é uma linha com o peso total. Preserva a ordem de aparição.
+
+### `sugerir_pasta(nome_lido, pastas_existentes)` e `_palavras_para_comparacao(texto)`
+
+Ao abrir a tela de conferência, cada item lido precisa ir pra uma pasta. `sugerir_pasta` compara as **palavras** do nome lido (minúsculas, sem acento — via `_palavras_para_comparacao`, que usa `unicodedata.normalize("NFKD", ...)`) com as de cada pasta existente. A pontuação é a **fração das palavras da pasta** presentes no nome lido — assim "Aveia Flocos Marca X" cobre 100% da pasta "Aveia Flocos" mas só ~50% de "Aveia Grão". Devolve a melhor pasta se a pontuação for ≥ 0.6, senão `None` (e quem chamou oferece criar uma pasta nova, ou usa o próprio nome lido como sugestão).
+
+### `listar_modelos_ia(api_key=None)`
+
+`GET` em `…/models?pageSize=200`, filtra os que suportam `generateContent`, tira o prefixo `models/` e devolve a lista ordenada. Usado pelo `ConfigDialog` ("Buscar modelos") e por `_ia_descobrir_modelo`.
+
+---
+
+## 18. Diálogo `ConfigDialog` 🆕⁵
+
+`QDialog` modal (aberto pelo botão "⚙️ Configurar" da lista de produtos, e como "porteiro" antes de importar uma nota) pra configurar os segredos e o modelo da IA. Campos:
+
+- **URL da planilha** — `QLineEdit` em modo `Password` + botão 👁 (via o helper `_campo_segredo`). É o endereço do Web App do Apps Script; **obrigatório** — sem ele o app não carrega nenhuma empresa.
+- **Chave da API (IA)** — mesmo componente. **Opcional**: só serve pra ler notas fiscais.
+- **Modelo** — `QComboBox` editável. O botão **"Buscar modelos"** chama `listar_modelos_ia(api_key=<chave digitada>)` e popula o combo com os modelos que **aquela** chave libera, pré-selecionando um Flash (preferindo um que não seja `lite`/`image`). Essa chamada é síncrona e roda na thread da interface (`QApplication.processEvents()` só atualiza a mensagem "Buscando…"), então a janela fica momentaneamente parada durante a busca — aceitável num diálogo de configuração, mas é uma diferença em relação à leitura de notas, que roda em thread.
+
+`_campo_segredo(valor, placeholder)` é um helper que monta um `QLineEdit` em modo senha + botão 👁 pra revelar — os dois segredos ficam ocultos por padrão.
+
+Ao salvar (`_salvar`): exige pelo menos a URL da planilha; se ela estiver preenchida, valida que casa com `https://script.google.com/.../exec`. Grava `sheets_webhook_url`, `gemini_api_key` e `gemini_modelo` via `salvar_config` (tratando erro de escrita com um `QMessageBox.critical`) e fecha com `accept()`.
+
+`ProductListPage._garantir_ia_configurada()` usa esse diálogo como "porteiro" da importação de notas: se ainda não há chave (`ia_api_key()` vazio), pergunta se o usuário quer configurar agora, abre o `ConfigDialog` e só deixa a importação prosseguir se ao final houver uma chave.
+
+---
+
+## 19. Página de conferência `ImportarNotaFiscalPage` 🆕⁵
+
+Página cheia (mais uma tela do `QStackedWidget`, não uma janela flutuante) pra revisar os itens que a IA leu, **antes** de qualquer coisa ir pro Sheets. Layout em duas colunas:
+
+- **Esquerda** — a foto da nota (quando a importação veio de foto), num `QScrollArea`, pra conferência lado a lado. Quando veio de link, mostra um aviso ("os itens vieram da página oficial da SEFAZ… confira mesmo assim") em vez da imagem. A distinção é `veio_de_foto = bool(self.caminho_imagem) and not QPixmap(self.caminho_imagem).isNull()`.
+- **Direita** — uma `QTableWidget` com uma linha por item lido e 5 colunas: **Pasta (produto)**, **Nome**, **Data**, **Quantidade**, **Preço Unitário**. A coluna Pasta é um `QComboBox` editável, já preenchido com a sugestão de `sugerir_pasta` (ou o próprio nome lido); as pastas existentes ficam na lista suspensa, e digitar uma pasta nova cria a pasta na hora ao confirmar.
+
+Botões: **+ Adicionar item** / **- Remover item selecionado** / **✅ Confirmar tudo**.
+
+`_confirmar_tudo()` percorre as linhas, conta as incompletas (sem pasta, ou com quantidade/preço ≤ 0) numa variável `ignoradas`, monta um `registro` por linha válida (com `id` novo, `empresa`, `produto` = a pasta, `nome`, `data`, `quantidade`, `preco_unitario`, `preco_total`) e dispara `sheets_salvar(novas, [])` num `SheetsWorker` (mantido em `self._workers_ativos`, mesmo padrão das outras páginas). Se **todas** as linhas forem inválidas, avisa e não faz nada. 🆕⁵ Se **algumas** forem inválidas, um `QMessageBox.question` diz quantas serão ignoradas e pede confirmação antes de salvar as outras (antes elas eram descartadas em silêncio). Em caso de sucesso, chama `ao_confirmar_callback(len(novas))` — que a `MainWindow` liga a um `QMessageBox` "N itens salvos" seguido de voltar pra lista de produtos (que recarrega e mostra os itens novos).
+
+Segue os mesmos cuidados de ciclo de vida das outras telas: flag `_destruida` / `marcar_destruida()` (checada antes de tocar em widgets num callback de rede atrasado) e `_definir_ocupado` desabilitando os botões, inclusive "← Cancelar", durante o salvamento.
+
+---
+
+## 20. Notas de análise — código morto, bugs e segurança
+
+Levantamento acumulado das revisões 🆕⁵. Nenhum item é um crash garantido do fluxo normal; são pontas soltas, casos de borda e exposição de segredo.
+
+### 🔒 Segurança
+
+- **A URL do Web App do Apps Script estava hardcoded no código — e está no histórico do git.** Ela é uma "URL-capacidade": com o acesso do Web App em "Qualquer pessoa", quem tem a URL lê e escreve na planilha inteira, sem autenticação. Ela foi commitada (`1214db9`) e depois trocada por `""` (`22310eb`), mas **continua nos dois commits**, que já foram enviados pro GitHub (`origin/main`). **Providências:**
+  1. Feito: a URL saiu do código (`sheets_webhook_url()`, config.json / variável de ambiente) — commits novos ficam limpos.
+  2. **Recomendado: rotacionar a URL.** No editor do Apps Script, crie uma **nova implantação** (gera uma URL nova) e **arquive/exclua a antiga** — isso mata a URL vazada. Depois cole a nova em "⚙️ Configurar".
+  3. Opcional: reescrever o histórico (`git filter-repo` + `push --force`) pra apagar a URL dos commits antigos. Só vale a pena junto com o passo 2.
+- **A chave da API do Gemini nunca esteve no repositório** — sempre foi lida de `~/.config/.../config.json` (permissão `600`) ou da variável de ambiente. OK.
+- **`.gitignore` está fora do versionamento.** Ele protege `cache/` (que guarda dados reais de compra e até uma foto de nota — `_ultima_nota_corrigida.jpg`). Enquanto não for commitado, um clone novo não ignora `cache/` e é fácil commitar esses dados sem querer. Recomendado versionar o `.gitignore`.
+- **`ler_nota_fiscal_link` busca uma URL arbitrária informada pelo usuário** e manda o texto pro Gemini. Como é um app local de um usuário só, que digita a própria URL, o risco é baixo — mas não há allowlist de domínios da SEFAZ; um link malicioso colado por engano faria o app buscar aquele endereço.
+
+### Código morto / incompleto
+
+- **`sheets_renomear_produtos` (Python) não tem nenhum chamador.** O backend `renomearProdutos` está 100% implementado e a ação `"renomearProdutos"` do `doPost` funciona, mas **nenhuma tela** invoca `sheets_renomear_produtos` — a "ferramenta de mesclagem/migração de pastas" citada nos comentários não existe na interface. É encanamento pronto pra uma feature que não foi construída. Decidir: construir a tela, ou remover a função Python (e, se quiser, a ação do backend) até a feature entrar de fato.
+
+### Bugs corrigidos nas revisões 🆕⁵
+
+- **`_nome_apresentavel` deixava Title Case passar** — nomes subiam pro Sheets com capitalização inconsistente (CAIXA ALTA, Title Case e frase misturados). Agora é sempre frase.
+- **Troca de modelo indevida em erro não-404** — `_ia_gerar_itens` chamava `_ia_descobrir_modelo()` (que **grava** um modelo novo no `config.json`) em **qualquer** `ErroIA`, inclusive limite de uso (429) e falha de rede. Um 429 passageiro podia rebaixar em definitivo, digamos, `gemini-2.5-pro` → `gemini-2.0-flash`. Corrigido: só troca se o erro for especificamente "modelo não existe".
+- **`ImportarNotaFiscalPage._confirmar_tudo` descartava linhas incompletas em silêncio.** Agora conta as ignoradas e pede confirmação (`"N linha(s)… vão ser ignoradas. Salvar as outras M?"`) antes de salvar.
+- **`_inserir_linha_produto` fazia `quantidade * preco_unitario` sem `parse_numero`** — se uma dessas viesse como string vazia do cache/Sheets, dava `TypeError` ao montar a lista de produtos. Agora passa pelas duas por `parse_numero`.
+
+### Pontos a considerar (não corrigidos)
+
+- **`_ia_descobrir_modelo`, sem nenhum Flash na conta, cai em `nomes[0]`** — que pode ser um modelo Pro (mais caro) — e **grava** essa escolha. Improvável (toda conta Gemini tem Flash), mas o fallback poderia parar em `MODELO_IA_PADRAO` sem gravar.
+- **`ConfigDialog._buscar_modelos` faz a chamada de rede na thread da interface** — a janela congela por até 30s se a API demorar. As leituras de nota já rodam em thread; esse diálogo não.
+- **Quantidade/preço da IA aparecem como `2.0` / `12.9` na tabela de conferência** (repr de float). Cosmético.
+- **`apps_script_backend.gs` está sem quebra de linha no fim do arquivo** (`\ No newline at end of file`). Trivial.
+- **Portabilidade (pra virar app distribuído):** `CACHE_DIR`/`CONFIG_DIR` e o carregamento de `assets/` assumem execução a partir do `.py`; empacotado com PyInstaller (`__file__` vira pasta temporária, e no Windows a pasta do executável costuma ser somente-leitura) isso quebra. Ver o plano de refatoração para pacote.
 
 ---
 
@@ -1156,4 +1468,15 @@ Por fim, `doPost` chama `invalidarCache()` depois de qualquer `salvar` ou `remov
 | 🆕⁴ **`_remocoes_em_andamento`** | Contador de remoções ainda não confirmadas; `_salvar`/`_recarregar_do_sheets` (e o `recarregar` da lista de produtos) recusam começar enquanto ele for maior que zero |
 | 🆕⁴ **`ID_ABA_DADOS`** | Script Property do Apps Script que guarda o `getSheetId()` da aba "fixada" — usada por `getPlanilha()` pra sempre voltar na mesma aba, em vez de seguir a aba "ativa" no navegador |
 | 🆕⁴ **`idsNaoEncontrados`** | Lista devolvida por `salvarRegistros`/`doPost` com os IDs "existentes" que não foram achados na planilha — o Python usa isso pra manter essas linhas específicas como pendentes, em vez de assumir que tudo foi salvo |
+| 🆕⁵ **Pasta (produto)** | O tipo do produto (coluna "Produto"), ex: "Aveia Flocos" — agrupa várias compras/marcas |
+| 🆕⁵ **Nome (da compra)** | Coluna "Nome" / `COL_NOME`: o texto da marca/embalagem daquela compra específica, ex: "Aveia Flocos Marca X 500g" |
+| 🆕⁵ **`config.json`** | `~/.config/controle_empresas/config.json` (permissão `600`, fora do git): guarda `sheets_webhook_url`, `gemini_api_key` e `gemini_modelo` |
+| 🆕⁵ **`sheets_webhook_url()`** | Resolve a URL do Web App (variável de ambiente `GOOGLE_SHEETS_WEBHOOK_URL` → `config.json` → `""`); substituiu a constante hardcoded. A URL é um segredo: quem a tem lê/escreve na planilha |
+| 🆕⁵ **`ConfigDialog`** | Antigo `ConfigIADialog`: diálogo "⚙️ Configurar" com a URL da planilha (obrigatória) + a chave da API do Gemini e o modelo (opcionais); os dois segredos ficam ocultos por padrão |
+| 🆕⁵ **`ErroIA`** | Exceção única da leitura de notas por IA (chave recusada, rede fora, modelo inexistente, limite de uso…); capturada pelo `SheetsWorker` junto com `ErroSheets` |
+| 🆕⁵ **`_nome_apresentavel`** | Padroniza todo nome lido da nota como frase (só a 1ª letra maiúscula), pra a lista não misturar CAIXA ALTA / Title Case / frase |
+| 🆕⁵ **`_ia_descobrir_modelo`** | Quando o modelo configurado dá 404, acha um Flash válido na conta e grava no `config.json` — só em erro 404, não em 429/rede |
+| 🆕⁵ **`sugerir_pasta`** | Sugere a pasta de destino de um item lido comparando as palavras do nome com as pastas existentes (limiar 0.6) |
+| 🆕⁵ **`ImportarNotaFiscalPage`** | Tela de conferência dos itens que a IA leu de uma nota; nada vai pro Sheets sem o usuário revisar e clicar em "✅ Confirmar tudo" |
+| 🆕⁵ **`renomearProdutos`** | Ação do backend (e `sheets_renomear_produtos` no Python) que renomeia pasta/nome por ID — implementada, mas ainda sem tela que a use |
 | 🆕⁴ **`LockService`** | Serviço do Apps Script usado em `doPost` pra impedir que duas requisições de escrita rodem ao mesmo tempo e disputem os mesmos números de linha |
