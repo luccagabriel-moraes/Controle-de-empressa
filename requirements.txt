@@ -1,0 +1,6 @@
+# Dependência de execução do app (só uma).
+PyQt6>=6.5
+
+# Só pra gerar o executável (pip install -r requirements.txt inclui; se quiser
+# só rodar o app, instale apenas PyQt6):
+pyinstaller>=6.0

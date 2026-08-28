@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+cache/
+
+# saída do PyInstaller
+build/
+dist/
+*.manifest
+
+# config pessoal, se algum dia alguém deixar uma cópia na pasta do projeto
+config.json

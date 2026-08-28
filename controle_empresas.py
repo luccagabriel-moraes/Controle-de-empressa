@@ -4,6 +4,8 @@ import re
 import json
 import uuid
 import base64
+import shutil
+import ipaddress
 import unicodedata
 import urllib.request
 import urllib.error
@@ -22,23 +24,57 @@ from PyQt6.QtCore import Qt, QDate, QSize, QRectF, QPointF, QThread, pyqtSignal,
 from PyQt6.QtGui import QFont, QColor, QPixmap, QPainter, QPainterPath, QPen, QLinearGradient, QPalette
 
 # --------------------------------------------------------------------------- #
-# Configuração
+# Configuração e caminhos
 # --------------------------------------------------------------------------- #
+# O app roda tanto "solto" (python controle_empresas.py) quanto empacotado com
+# o PyInstaller (um .exe no Windows). Isso muda onde os arquivos ficam:
+#   - assets (logos): acompanham o app. Empacotado, ficam numa pasta temporária
+#     (sys._MEIPASS); soltos, ao lado do .py. `resource_path()` acha os dois.
+#   - config e cache: NUNCA ao lado do executável (no Windows a pasta do
+#     programa costuma ser somente-leitura). Sempre numa pasta gravável por
+#     usuário do sistema: %APPDATA%/%LOCALAPPDATA% no Windows, ~/.config e
+#     ~/.cache no Linux.
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ASSETS_DIR = os.path.join(BASE_DIR, "assets")
-CACHE_DIR = os.path.join(BASE_DIR, "cache")
+APP_NOME = "controle_empresas"
+
+
+def _empacotado() -> bool:
+    """True quando rodando como .exe/.bin gerado pelo PyInstaller."""
+    return getattr(sys, "frozen", False)
+
+
+def resource_path(*partes: str) -> str:
+    """Caminho de um recurso somente-leitura que acompanha o app
+    (ex: resource_path('assets', 'granola_pura.png'))."""
+    if _empacotado():
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, *partes)
+
+
+def _dir_dados_usuario(tipo: str) -> str:
+    """Pasta gravável por-usuário pra 'config' ou 'cache', por SO."""
+    if sys.platform.startswith("win"):
+        raiz = os.environ.get("LOCALAPPDATA" if tipo == "cache" else "APPDATA")
+        raiz = raiz or os.path.expanduser("~")
+    elif tipo == "cache":
+        raiz = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    else:
+        raiz = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(raiz, APP_NOME)
+
+
+ASSETS_DIR = resource_path("assets")
+CONFIG_DIR = _dir_dados_usuario("config")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+CACHE_DIR = _dir_dados_usuario("cache")
 
 # A URL do Web App do Apps Script (termina em "/exec") NÃO fica no código: quem
 # tem essa URL lê e escreve na planilha inteira, então ela é um segredo e não
 # pode entrar no git. Ela vem da variável de ambiente GOOGLE_SHEETS_WEBHOOK_URL
 # ou do config.json (ver sheets_webhook_url()); o diálogo "⚙️ Configurar" grava.
-
-# Configuração pessoal do usuário (URL da planilha, chave da API de IA, modelo).
-# Fica fora da pasta do projeto e fora do git — guarda segredos. O diálogo
-# "⚙️ Configurar" (ConfigDialog) lê e grava esse arquivo.
-CONFIG_DIR = os.path.expanduser("~/.config/controle_empresas")
-CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+# A chave da API do Gemini segue o mesmo caminho (GEMINI_API_KEY / config.json).
 
 # Modelo padrão pra ler as notas. Se um dia ele for desligado, a primeira
 # leitura que falhar com 404 dispara _ia_descobrir_modelo(), que acha um
@@ -109,9 +145,11 @@ def gerar_id() -> str:
 # --------------------------------------------------------------------------- #
 
 def carregar_config() -> dict:
-    """Lê ~/.config/controle_empresas/config.json. Devolve {} se não existir
-    ou estiver corrompido — o app funciona sem ele, só o botão de importar
-    nota fiscal fica indisponível até a chave ser configurada."""
+    """Lê o config.json (ver CONFIG_PATH). Devolve {} se não existir ou estiver
+    corrompido — o app abre, mas não carrega nenhuma empresa até a URL da
+    planilha ser configurada. Pode ser chamada de várias threads ao mesmo
+    tempo; `salvar_config` grava de forma atômica pra a leitura nunca ver o
+    arquivo pela metade."""
     try:
         with open(CONFIG_PATH, encoding="utf-8") as arquivo:
             dados = json.load(arquivo)
@@ -121,13 +159,20 @@ def carregar_config() -> dict:
 
 
 def salvar_config(dados: dict) -> None:
-    """Grava a configuração com permissão 600 (só o dono lê) — a chave da API
-    é um segredo e não deve ficar legível pra outros usuários da máquina."""
+    """Grava a configuração como texto puro num arquivo só do dono (permissão
+    600 no POSIX) — a URL da planilha e a chave da API são segredos e não
+    devem ficar legíveis pra outros usuários da máquina. A escrita é atômica
+    (arquivo temporário + os.replace): um leitor concorrente vê a versão
+    antiga inteira ou a nova inteira, nunca um JSON truncado."""
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as arquivo:
+    temporario = CONFIG_PATH + ".tmp"
+    # abre já com 0600 (sem a janela entre criar com o umask e o chmod)
+    fd = os.open(temporario, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as arquivo:
         json.dump(dados, arquivo, ensure_ascii=False, indent=2)
+    os.replace(temporario, CONFIG_PATH)
     try:
-        os.chmod(CONFIG_PATH, 0o600)
+        os.chmod(CONFIG_PATH, 0o600)  # caso o arquivo destino já existisse com outra permissão
     except OSError:
         pass  # sistemas de arquivos sem permissões POSIX (ex: pen drive) — segue sem
 
@@ -279,6 +324,23 @@ def ler_nota_fiscal_ia(caminho_imagem: str) -> list:
     ])
 
 
+def _recusar_host_interno(url: str) -> None:
+    """Levanta ErroIA se a URL aponta pra localhost ou pra um IP de rede
+    interna (loopback, link-local, privado). O link da nota é digitado pelo
+    usuário e vai pra um fetch do lado dele; isso evita que um link colado por
+    engano (ou de má-fé) faça o app sondar a rede local — o texto da resposta
+    ainda seria mandado pro Gemini."""
+    host = (urllib.parse.urlparse(url).hostname or "").strip("[]").lower()
+    if not host or host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        raise ErroIA("Esse endereço não parece ser o de uma nota fiscal da SEFAZ.")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return  # é um nome de domínio comum — segue
+    if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+        raise ErroIA("Esse endereço aponta pra rede interna e não pode ser aberto pelo app.")
+
+
 def ler_nota_fiscal_link(url: str) -> list:
     """Baixa a página oficial de consulta de uma NFC-e (o link do QR code) e
     manda o texto pra IA extrair os itens. Dados oficiais e completos —
@@ -289,6 +351,7 @@ def ler_nota_fiscal_link(url: str) -> list:
     url = (url or "").strip()
     if not re.match(r"https?://", url, re.IGNORECASE):
         raise ErroIA("Cole o link completo do QR code da nota (deve começar com http:// ou https://).")
+    _recusar_host_interno(url)
 
     try:
         requisicao = urllib.request.Request(url, headers={
@@ -593,6 +656,29 @@ def cache_salvar(empresa: str, linhas: list):
         pass  # cache é só otimização; se falhar, seguimos sem ele
 
 
+def migrar_cache_antigo() -> None:
+    """Até esta versão o cache ficava em <pasta do script>/cache. Agora fica
+    numa pasta por-usuário (ver CACHE_DIR). Move os .json da pasta antiga pra
+    nova, uma vez, pra não perder o 'aparece na hora' na primeira abertura
+    depois da atualização. Best-effort: qualquer erro é ignorado."""
+    if _empacotado():
+        return
+    antigo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+    if os.path.abspath(antigo) == os.path.abspath(CACHE_DIR):
+        return
+    if not os.path.isdir(antigo) or os.path.isdir(CACHE_DIR):
+        return
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        for nome in os.listdir(antigo):
+            if nome.endswith(".json"):
+                # shutil.move (não os.replace) pra funcionar mesmo se a pasta
+                # nova estiver em outro sistema de arquivos que a antiga
+                shutil.move(os.path.join(antigo, nome), os.path.join(CACHE_DIR, nome))
+    except OSError:
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # Integração com Google Sheets
 # --------------------------------------------------------------------------- #
@@ -780,6 +866,10 @@ class LabelElidavel(QLabel):
 
     def __init__(self, texto: str = "", parent=None):
         super().__init__(parent)
+        # texto puro: nomes de empresa/produto vêm da planilha e da IA; sem
+        # isso, um nome com cara de HTML ("<b>...", "<img ...>") seria
+        # interpretado como rich text pelo QLabel.
+        self.setTextFormat(Qt.TextFormat.PlainText)
         self._texto_completo = ""
         self.setText(texto)
 
@@ -933,43 +1023,36 @@ class TabelaComNavegacaoEnter(QTableWidget):
 
 
 # --------------------------------------------------------------------------- #
-# Página 3: registros (compras) de um produto específico
+# Base das telas cheias (compras, importar nota, lista de produtos)
 # --------------------------------------------------------------------------- #
 
-class ProductEntriesPage(QWidget):
-    """Mostra e edita as compras de um produto. Cada linha da tabela guarda
-    seu ID da planilha em Qt.ItemDataRole.UserRole (None = ainda não existe
-    no Sheets)."""
+class PaginaBase(QWidget):
+    """Concentra o encanamento que era copiado nas três telas cheias:
 
-    def __init__(self, empresa: dict, produto: str, linhas_iniciais: list, voltar_callback):
+    - `_disparar_worker`: roda uma função de rede num SheetsWorker mantendo
+      uma referência forte a ele em `_workers_ativos` até terminar — sem isso,
+      disparar uma segunda operação em paralelo (ex: remover duas linhas
+      rápido) sobrescreveria a única referência à primeira QThread, que ainda
+      rodando e sem dono podia ser coletada no meio da execução e derrubar o app;
+    - `marcar_destruida` / `_destruida`: a MainWindow marca a página como "de
+      saída" ANTES de destruí-la; os callbacks de rede atrasados checam essa
+      flag antes de mexer em widgets já apagados pelo Qt (evita o
+      `RuntimeError: wrapped C/C++ object ... has been deleted`);
+    - `_definir_ocupado`: bloqueia os botões de `_botoes_bloqueaveis()`
+      enquanto uma chamada de rede está em andamento;
+    - `_texto_celula` / `_estilo_botao_destaque`: helpers de UI comuns.
+    """
+
+    def __init__(self):
         super().__init__()
-        self.empresa = empresa
-        self.produto = produto
-        self.cor = empresa["cor"]
-        self.voltar_callback = voltar_callback
-        self._carregando = False
+        self._workers_ativos = []
         self._operacao_em_andamento = False
-        self._workers_ativos = []  # referências fortes aos SheetsWorker em voo (ver _disparar_worker)
-        self._remocoes_em_andamento = 0  # quantas remoções de linha ainda não confirmaram (ver _salvar/_recarregar)
-        self._alteracoes_nao_salvas = False  # edição pendente de salvar (ver _tentar_voltar)
-        self._itens_editados = set()  # ids de objeto das linhas tocadas desde o último salvamento (ver _salvar)
-        # True quando a MainWindow já destruiu esta página (ex: abriu outro
-        # produto); callbacks de rede atrasados checam isso antes de mexer
-        # em widgets, evitando o RuntimeError de objeto C++ já deletado.
         self._destruida = False
-
-        self._montar_ui()
-        self._popular_tabela(linhas_iniciais)
 
     def marcar_destruida(self):
         self._destruida = True
 
     def _disparar_worker(self, funcao, *args, ao_concluir):
-        """Roda uma função de rede em segundo plano. Mantém uma referência
-        forte ao worker em self._workers_ativos até ele terminar — sem isso,
-        disparar uma segunda operação em paralelo (ex: remover duas linhas
-        rapidamente) sobrescreveria a única referência Python à primeira
-        QThread ainda rodando, arriscando derrubar o app."""
         worker = SheetsWorker(funcao, *args)
         self._workers_ativos.append(worker)
 
@@ -981,6 +1064,55 @@ class ProductEntriesPage(QWidget):
         worker.concluido.connect(_finalizar)
         worker.start()
         return worker
+
+    def _botoes_bloqueaveis(self):
+        """Botões desabilitados por `_definir_ocupado`. Cada página sobrescreve."""
+        return ()
+
+    def _definir_ocupado(self, ocupado: bool, mensagem: str = ""):
+        self._operacao_em_andamento = ocupado
+        for botao in self._botoes_bloqueaveis():
+            botao.setEnabled(not ocupado)
+        if mensagem and getattr(self, "status_label", None) is not None:
+            self.status_label.setStyleSheet("color: #d9a441;")
+            self.status_label.setText(mensagem)
+
+    def _texto_celula(self, row: int, col: int) -> str:
+        item = self.tabela.item(row, col)
+        return item.text().strip() if item else ""
+
+    def _estilo_botao_destaque(self) -> str:
+        return (
+            f"QPushButton {{ background-color: {self.cor}; color: {self.empresa['cor_texto']}; "
+            f"font-weight: bold; padding: 6px 12px; border-radius: 4px; }}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Página 3: registros (compras) de um produto específico
+# --------------------------------------------------------------------------- #
+
+class ProductEntriesPage(PaginaBase):
+    """Mostra e edita as compras de um produto. Cada linha da tabela guarda
+    seu ID da planilha em Qt.ItemDataRole.UserRole (None = ainda não existe
+    no Sheets). Encanamento de rede/ciclo de vida vem de PaginaBase."""
+
+    def __init__(self, empresa: dict, produto: str, linhas_iniciais: list, voltar_callback):
+        super().__init__()
+        self.empresa = empresa
+        self.produto = produto
+        self.cor = empresa["cor"]
+        self.voltar_callback = voltar_callback
+        self._carregando = False
+        self._remocoes_em_andamento = 0  # remoções de linha ainda não confirmadas (ver _salvar/_recarregar)
+        self._alteracoes_nao_salvas = False  # edição pendente de salvar (ver _tentar_voltar)
+        self._itens_editados = set()  # ids de objeto das linhas tocadas desde o último salvamento (ver _salvar)
+
+        self._montar_ui()
+        self._popular_tabela(linhas_iniciais)
+
+    def _botoes_bloqueaveis(self):
+        return (self.btn_add, self.btn_remover, self.btn_salvar, self.btn_recarregar, self.btn_voltar)
 
     def _montar_ui(self):
         layout = QVBoxLayout(self)
@@ -1113,22 +1245,6 @@ class ProductEntriesPage(QWidget):
         linha.addStretch()
         linha.addWidget(self.btn_salvar)
         return linha
-
-    def _estilo_botao_destaque(self) -> str:
-        return (
-            f"QPushButton {{ background-color: {self.cor}; color: {self.empresa['cor_texto']}; "
-            f"font-weight: bold; padding: 6px 12px; border-radius: 4px; }}"
-        )
-
-    def _definir_ocupado(self, ocupado: bool, mensagem: str = ""):
-        """Bloqueia os botões (inclusive Voltar) enquanto uma chamada de rede
-        está em andamento, pra evitar sair da tela no meio de uma operação."""
-        self._operacao_em_andamento = ocupado
-        for botao in (self.btn_add, self.btn_remover, self.btn_salvar, self.btn_recarregar, self.btn_voltar):
-            botao.setEnabled(not ocupado)
-        if mensagem:
-            self.status_label.setStyleSheet("color: #d9a441;")
-            self.status_label.setText(mensagem)
 
     def _tentar_voltar(self):
         """Chamado pelo botão "← Voltar". Se existir alguma alteração ainda
@@ -1287,10 +1403,6 @@ class ProductEntriesPage(QWidget):
         item_total.setText(format_moeda(qtd * preco))
         item_total.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         self._carregando = False
-
-    def _texto_celula(self, row: int, col: int) -> str:
-        item = self.tabela.item(row, col)
-        return item.text().strip() if item else ""
 
     def _atualizar_indicadores(self):
         total_geral = 0.0
@@ -1618,13 +1730,13 @@ class ConfigDialog(QDialog):
 # Página de conferência dos itens lidos por foto de uma nota fiscal
 # --------------------------------------------------------------------------- #
 
-class ImportarNotaFiscalPage(QWidget):
+class ImportarNotaFiscalPage(PaginaBase):
     """Página cheia (não é uma janela flutuante) pra revisar os itens que a
     IA leu de uma foto de nota fiscal: a própria foto fica visível à
     esquerda, pra conferência lado a lado, e a tabela à direita mostra cada
     item reconhecido — pra qual pasta ele vai, com que nome, data, quantidade
     e preço. Nada é salvo no Sheets até o usuário revisar e clicar em
-    "✅ Confirmar tudo"."""
+    "✅ Confirmar tudo". Encanamento de rede/ciclo de vida vem de PaginaBase."""
 
     COL_PASTA, COL_NOME, COL_DATA, COL_QTD, COL_PRECO = range(5)
 
@@ -1637,15 +1749,12 @@ class ImportarNotaFiscalPage(QWidget):
         self.pastas_existentes = sorted(pastas_existentes, key=str.lower)
         self.voltar_callback = voltar_callback
         self.ao_confirmar_callback = ao_confirmar_callback  # chamado com a quantidade salva, após sucesso
-        self._operacao_em_andamento = False
-        self._workers_ativos = []  # referências fortes aos SheetsWorker em voo (ver _disparar_worker)
-        self._destruida = False  # ver marcar_destruida, mesmo padrão das outras páginas
 
         self._montar_ui()
         self._popular_tabela(itens_lidos)
 
-    def marcar_destruida(self):
-        self._destruida = True
+    def _botoes_bloqueaveis(self):
+        return (self.btn_add, self.btn_remover, self.btn_confirmar, self.btn_voltar)
 
     def _montar_ui(self):
         layout_principal = QHBoxLayout(self)
@@ -1752,14 +1861,6 @@ class ImportarNotaFiscalPage(QWidget):
 
         layout_principal.addLayout(painel_direito, stretch=1)
 
-    def _definir_ocupado(self, ocupado: bool, mensagem: str = ""):
-        self._operacao_em_andamento = ocupado
-        for botao in (self.btn_add, self.btn_remover, self.btn_confirmar, self.btn_voltar):
-            botao.setEnabled(not ocupado)
-        if mensagem:
-            self.status_label.setStyleSheet("color: #d9a441;")
-            self.status_label.setText(mensagem)
-
     def _popular_tabela(self, itens: list):
         if itens:
             for item in itens:
@@ -1793,10 +1894,6 @@ class ImportarNotaFiscalPage(QWidget):
         row = self.tabela.currentRow()
         if row >= 0:
             self.tabela.removeRow(row)
-
-    def _texto_celula(self, row: int, col: int) -> str:
-        item = self.tabela.item(row, col)
-        return item.text().strip() if item else ""
 
     def _cancelar(self):
         self.voltar_callback()
@@ -1844,12 +1941,8 @@ class ImportarNotaFiscalPage(QWidget):
                 return
 
         self._definir_ocupado(True, f"Salvando {len(novas)} item(ns) no Google Sheets...")
-        worker = SheetsWorker(sheets_salvar, novas, [])
-        self._workers_ativos.append(worker)
 
-        def _finalizar(sucesso, resultado):
-            if worker in self._workers_ativos:
-                self._workers_ativos.remove(worker)
+        def _ao_salvar(sucesso, resultado):
             if self._destruida:
                 return  # a página já foi fechada/trocada enquanto a rede respondia
             self._definir_ocupado(False)
@@ -1860,15 +1953,18 @@ class ImportarNotaFiscalPage(QWidget):
                 self.status_label.setText(f"Falha ao salvar: {resultado}")
                 QMessageBox.critical(self, "Erro ao salvar", str(resultado))
 
-        worker.concluido.connect(_finalizar)
-        worker.start()
+        self._disparar_worker(sheets_salvar, novas, [], ao_concluir=_ao_salvar)
 
 
 # --------------------------------------------------------------------------- #
 # Página 2: lista de produtos de uma empresa
 # --------------------------------------------------------------------------- #
 
-class ProductListPage(QWidget):
+class ProductListPage(PaginaBase):
+    """Lista os produtos de uma empresa. É a única página reaproveitada pela
+    MainWindow (uma por empresa), então não usa a flag `_destruida` — mas
+    herda o resto do encanamento de PaginaBase."""
+
     COL_PRODUTO, COL_ULTIMA_DATA, COL_ULTIMO_VALOR, COL_ABRIR = range(4)
 
     def __init__(self, empresa: dict, abrir_produto_callback, abrir_importar_foto_callback, voltar_callback):
@@ -1881,9 +1977,7 @@ class ProductListPage(QWidget):
 
         self._linhas_por_produto = {}   # produto -> [linhas da planilha]
         self._produtos_pendentes = []   # produtos criados nesta sessão, sem nenhuma compra salva
-        self._operacao_em_andamento = False
-        self._workers_ativos = []  # referências fortes aos SheetsWorker em voo (ver _disparar_worker)
-        self._remocoes_em_andamento = 0  # quantas remoções de produto ainda não confirmaram (ver recarregar)
+        self._remocoes_em_andamento = 0  # remoções de produto ainda não confirmadas (ver recarregar)
         self._ordem_crescente = True    # True = A-Z, False = Z-A
         self._texto_pesquisa = ""
         self._geracao_carregamento = 0
@@ -2015,35 +2109,9 @@ class ProductListPage(QWidget):
         self.status_label.setStyleSheet("color: #2e7d32;")
         layout.addWidget(self.status_label)
 
-    def _estilo_botao_destaque(self) -> str:
-        return (
-            f"QPushButton {{ background-color: {self.cor}; color: {self.empresa['cor_texto']}; "
-            f"font-weight: bold; padding: 6px 12px; border-radius: 4px; }}"
-        )
-
-    def _definir_ocupado(self, ocupado: bool):
-        self._operacao_em_andamento = ocupado
-        for botao in (self.btn_add, self.btn_remover, self.btn_recarregar,
-                      self.btn_importar_foto, self.btn_importar_link, self.btn_config_ia):
-            botao.setEnabled(not ocupado)
-
-    def _disparar_worker(self, funcao, *args, ao_concluir):
-        """Roda uma função de rede em segundo plano. Mantém uma referência
-        forte ao worker em self._workers_ativos até ele terminar — sem isso,
-        disparar uma segunda operação em paralelo sobrescreveria a única
-        referência Python à primeira QThread ainda rodando, arriscando
-        derrubar o app."""
-        worker = SheetsWorker(funcao, *args)
-        self._workers_ativos.append(worker)
-
-        def _finalizar(ok, resultado):
-            if worker in self._workers_ativos:
-                self._workers_ativos.remove(worker)
-            ao_concluir(ok, resultado)
-
-        worker.concluido.connect(_finalizar)
-        worker.start()
-        return worker
+    def _botoes_bloqueaveis(self):
+        return (self.btn_add, self.btn_remover, self.btn_recarregar,
+                self.btn_importar_foto, self.btn_importar_link, self.btn_config_ia)
 
     def recarregar(self):
         if self._operacao_em_andamento or self._remocoes_em_andamento > 0:
@@ -2507,7 +2575,9 @@ def aplicar_tema_escuro(app: QApplication):
 
 
 def main():
+    migrar_cache_antigo()
     app = QApplication(sys.argv)
+    app.setApplicationName("Controle de Empresas")
     app.setStyle("Fusion")
     aplicar_tema_escuro(app)
     janela = MainWindow()

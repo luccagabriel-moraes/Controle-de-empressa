@@ -1,0 +1,78 @@
+# Gera os executáveis do app (Windows e Linux) automaticamente e anexa numa
+# Release do GitHub, pra qualquer pessoa baixar sem precisar de Python.
+#
+# Como disparar:
+#   git tag v1.0
+#   git push origin v1.0
+# (ou rode "build" na mão pela aba Actions -> Run workflow)
+
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            nome_saida: ControleEmpresas-windows.exe
+            arquivo_gerado: dist/ControleEmpresas.exe
+          - os: ubuntu-latest
+            nome_saida: ControleEmpresas-linux
+            arquivo_gerado: dist/ControleEmpresas
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências Python
+        run: pip install -r requirements.txt
+
+      - name: Instalar libs de sistema do Qt (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0
+
+      - name: Gerar o executável
+        run: pyinstaller controle_empresas.spec
+
+      - name: Preparar o artefato
+        shell: bash
+        run: |
+          mkdir -p entrega
+          cp "${{ matrix.arquivo_gerado }}" "entrega/${{ matrix.nome_saida }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.nome_saida }}
+          path: entrega/${{ matrix.nome_saida }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: entrega
+          merge-multiple: true
+      - name: Criar/atualizar a Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" entrega/* \
+            --title "${GITHUB_REF_NAME}" --generate-notes \
+          || gh release upload "${GITHUB_REF_NAME}" entrega/* --clobber

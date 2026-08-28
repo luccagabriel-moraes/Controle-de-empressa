@@ -20,7 +20,11 @@
 >
 > **Changelog de importação por link do QR code:** além da foto, um botão **"🔗 Importar por link"** aceita o endereço do QR code de uma NFC-e. `ler_nota_fiscal_link` baixa a página oficial de consulta da SEFAZ (com um `User-Agent` de navegador), reduz o HTML a texto puro (`_texto_de_html`) e manda para o mesmo modelo, que extrai os itens do texto (dados oficiais e completos). As duas importações compartilham `_ia_gerar_itens` (monta o corpo, faz a chamada, aplica o fallback de modelo) e caem na mesma `ImportarNotaFiscalPage` — quando não há imagem, o painel esquerdo mostra um aviso em vez da foto. Portais que protegem a consulta com CAPTCHA (Santa Catarina, por exemplo) são detectados e o app orienta a usar a foto.
 >
-> **Changelog de segurança e limpeza (🆕⁵, esta revisão):** a URL do Web App do Apps Script — que dá acesso de leitura/escrita à planilha inteira — **saiu do código**: era uma constante hardcoded (e chegou a ser commitada no git). Agora vem de `sheets_webhook_url()` (variável de ambiente `GOOGLE_SHEETS_WEBHOOK_URL` ou `config.json`), e o antigo `ConfigIADialog` virou **`ConfigDialog`**, com um campo pra colar essa URL (segredo, oculto por padrão) além da chave da IA. A leitura por foto deixou de descartar linhas incompletas em silêncio (pede confirmação), e `_inserir_linha_produto` ficou tolerante a valores em branco. A [Seção 20](#20-notas-de-análise--código-morto-bugs-e-segurança) reúne todas as notas de análise, incluindo a recomendação de **rotacionar a URL do Web App** (ela continua no histórico do git já enviado ao GitHub).
+> **Changelog de segurança e limpeza (🆕⁵):** a URL do Web App do Apps Script — que dá acesso de leitura/escrita à planilha inteira — **saiu do código**: era uma constante hardcoded (e chegou a ser commitada no git). Agora vem de `sheets_webhook_url()` (variável de ambiente `GOOGLE_SHEETS_WEBHOOK_URL` ou `config.json`), e o antigo `ConfigIADialog` virou **`ConfigDialog`**, com um campo pra colar essa URL (segredo, oculto por padrão) além da chave da IA. A leitura por foto deixou de descartar linhas incompletas em silêncio (pede confirmação), e `_inserir_linha_produto` ficou tolerante a valores em branco. A [Seção 20](#20-notas-de-análise--código-morto-bugs-e-segurança) reúne todas as notas de análise, incluindo a recomendação de **rotacionar a URL do Web App** (ela continua no histórico do git já enviado ao GitHub).
+>
+> **Changelog de empacotamento e refatoração (🆕⁶):** o app foi preparado pra virar um **executável único** (PyInstaller — `.exe` no Windows), sem o usuário final precisar de Python. Mudou: (1) os caminhos — assets agora são resolvidos por `resource_path()` (acha tanto solto quanto dentro do pacote), e `config`/`cache` foram pra **pastas graváveis por-usuário do SO** (`%APPDATA%`/`%LOCALAPPDATA%` no Windows, `~/.config`/`~/.cache` no Linux) em vez de ficarem ao lado do executável; `migrar_cache_antigo()` move o cache da pasta antiga uma vez. (2) As três telas cheias (`ProductEntriesPage`, `ImportarNotaFiscalPage`, `ProductListPage`) agora herdam de **`PaginaBase`**, que concentra o encanamento antes triplicado (`_disparar_worker`, `marcar_destruida`/`_destruida`, `_definir_ocupado`, `_texto_celula`, `_estilo_botao_destaque`). Arquivos novos: `controle_empresas.spec`, `requirements.txt`. Ver a [Seção 21](#21-empacotamento-e-instalação-).
+>
+> **Changelog de distribuição e blindagem (🆕⁷, esta revisão):** (1) **CI de build** — `.github/workflows/build.yml` gera o `.exe` (Windows) e o binário (Linux) e publica numa Release do GitHub a cada tag `v*`, pra qualquer pessoa baixar pronto. (2) **Guia de instalação passo a passo** por sistema no `Readme.md` e resumido aqui (Seção 21). (3) Blindagem: `salvar_config` grava de forma **atômica** e já com permissão `600` (sem a janela de tempo do `chmod` posterior, e leitura concorrente nunca vê JSON truncado); `ler_nota_fiscal_link` recusa endereços de **rede interna/loopback** (`_recusar_host_interno`); `LabelElidavel` força **texto puro** (nome de produto com cara de HTML não é mais interpretado como rich text).
 
 ---
 
@@ -46,6 +50,7 @@
 18. [Diálogo `ConfigDialog` 🆕⁵](#18-diálogo-configdialog-)
 19. [Página de conferência `ImportarNotaFiscalPage` 🆕⁵](#19-página-de-conferência-importarnotafiscalpage-)
 20. [Notas de análise — código morto, bugs e segurança 🆕⁵](#20-notas-de-análise--código-morto-bugs-e-segurança)
+21. [Empacotamento e instalação 🆕⁶ 🆕⁷](#21-empacotamento-e-instalação-)
 
 ---
 
@@ -80,21 +85,26 @@ Como toda chamada de rede pode demorar, ela **nunca roda na thread principal da 
 ## 2. Configuração inicial
 
 ```python
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ASSETS_DIR = os.path.join(BASE_DIR, "assets")
-CACHE_DIR = os.path.join(BASE_DIR, "cache")  # 🆕
+# 🆕⁶ caminhos cientes de "solto" x "empacotado" (PyInstaller)
+def resource_path(*partes):        # assets: acompanham o app (sys._MEIPASS quando empacotado)
+    ...
+def _dir_dados_usuario(tipo):      # 'config' ou 'cache' -> pasta gravável por-usuário do SO
+    ...
+
+ASSETS_DIR  = resource_path("assets")
+CONFIG_DIR  = _dir_dados_usuario("config")   # %APPDATA%/.. no Windows, ~/.config/.. no Linux
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+CACHE_DIR   = _dir_dados_usuario("cache")    # %LOCALAPPDATA%/.. no Windows, ~/.cache/.. no Linux
 
 # 🆕⁵ nenhum segredo no código: a URL do Web App e a chave da API vêm do
 # config.json (fora do git) ou de variável de ambiente. Ver Seção 16.
-CONFIG_DIR = os.path.expanduser("~/.config/controle_empresas")
-CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 MODELO_IA_PADRAO = "gemini-2.5-flash"
 ```
 
-- `BASE_DIR` descobre a pasta onde o próprio arquivo `.py` está, e `ASSETS_DIR` aponta para a subpasta `assets/`, onde ficam as logos das empresas. Usar `__file__` em vez de um caminho fixo garante que o app funcione independente de onde ele for executado.
-- 🆕 `CACHE_DIR` aponta para uma subpasta `cache/`, criada automaticamente na primeira vez que o app salva alguma coisa em cache (ver [Seção 5](#5-cache-local-em-disco-)). Ela guarda um arquivo `.json` por empresa.
+- 🆕⁶ **`resource_path(*partes)`** resolve um recurso somente-leitura que acompanha o app (as logos em `assets/`). Rodando solto, a base é a pasta do `.py`; empacotado com o PyInstaller, é `sys._MEIPASS` (a pasta temporária onde o `.exe` se desempacota). Sem isso, `assets/` some quando o app vira executável.
+- 🆕⁶ **`_dir_dados_usuario("config"|"cache")`** devolve uma pasta **gravável por-usuário do sistema operacional** — nunca ao lado do executável, porque no Windows a pasta do programa costuma ser somente-leitura. No Windows: `%APPDATA%\controle_empresas` (config) e `%LOCALAPPDATA%\controle_empresas` (cache). No Linux: `~/.config/controle_empresas` e `~/.cache/controle_empresas` (respeitando `XDG_CONFIG_HOME`/`XDG_CACHE_HOME`). O caminho do config no Linux **não mudou**, então o `config.json` de quem já usava continua valendo; o cache mudou de lugar e `migrar_cache_antigo()` (ver [Seção 5](#5-cache-local-em-disco-)) faz a mudança uma vez.
 - 🆕⁵ **A URL do Web App do Apps Script não é mais uma constante no código.** Ela dá acesso de leitura/escrita à planilha inteira — é um segredo — e vinha hardcoded (e chegou a ser commitada, ver Seção 20). Agora vem de `sheets_webhook_url()` (variável de ambiente `GOOGLE_SHEETS_WEBHOOK_URL` ou `config.json`), configurável no diálogo "⚙️ Configurar" (ver [Seção 18](#18-diálogo-configdialog-)). Continua sendo a única "porta de entrada" do app para os dados.
-- 🆕⁵ `CONFIG_DIR` / `CONFIG_PATH` apontam para `~/.config/controle_empresas/config.json`, onde ficam a **URL da planilha**, a **chave da API do Google Gemini** e o modelo escolhido — fora da pasta do projeto porque são segredos e não devem entrar no git (ver [Seção 16](#16-configuração-e-segredos-em-disco-configjson-)). `MODELO_IA_PADRAO` é o modelo usado pra ler notas quando o `config.json` não define outro.
+- 🆕⁵ O `config.json` (em `CONFIG_PATH`) guarda a **URL da planilha**, a **chave da API do Google Gemini** e o modelo escolhido — fora da pasta do projeto porque são segredos e não devem entrar no git (ver [Seção 16](#16-configuração-e-segredos-em-disco-configjson-)). `MODELO_IA_PADRAO` é o modelo usado pra ler notas quando o `config.json` não define outro.
 
 ```python
 COMPANIES = [
@@ -385,7 +395,18 @@ def cache_salvar(empresa: str, linhas: list):
         pass
 ```
 
-Grava a lista de linhas mais recente da empresa em disco, criando a pasta `cache/` se ainda não existir. É chamada logo depois de uma busca bem-sucedida no Sheets (dentro de `ProductListPage._on_carregamento_concluido`, ver [Seção 9](#9-página-2--lista-de-produtos-productlistpage)). Se a escrita falhar por qualquer motivo (disco cheio, sem permissão etc.), o erro é ignorado — de novo, o cache nunca deve derrubar o app.
+Grava a lista de linhas mais recente da empresa em disco, criando a pasta de cache se ainda não existir. É chamada logo depois de uma busca bem-sucedida no Sheets (dentro de `ProductListPage._on_carregamento_concluido`, ver [Seção 9](#9-página-2--lista-de-produtos-productlistpage)). Se a escrita falhar por qualquer motivo (disco cheio, sem permissão etc.), o erro é ignorado — de novo, o cache nunca deve derrubar o app.
+
+### 🆕⁶ `migrar_cache_antigo()`
+
+```python
+def migrar_cache_antigo() -> None:
+    # até esta versão o cache ficava em <pasta do script>/cache;
+    # agora fica em CACHE_DIR (pasta por-usuário do SO). Move os .json
+    # de lá pra cá, uma vez, best-effort.
+```
+
+Chamada uma vez no início de `main()`. `CACHE_DIR` deixou de ser `<pasta do script>/cache` e passou a ser uma pasta gravável por-usuário (ver [Seção 2](#2-configuração-inicial)) — obrigatório pra funcionar empacotado no Windows. Pra quem já usava o app, essa função move os `.json` da pasta antiga pra nova na primeira execução, pra não perder o "aparece na hora". Não roda quando empacotado (aí nunca houve pasta antiga) e qualquer erro é silenciosamente ignorado — o cache é descartável.
 
 **Onde isso entra no fluxo:** quando `ProductListPage.recarregar()` é chamado, ele primeiro tenta `cache_carregar(...)` e, se achar algo, já popula a tabela imediatamente com esses dados (mostrando uma mensagem tipo "Mostrando dados salvos localmente — atualizando..."). Só depois disso ele dispara o `SheetsWorker` de verdade, que vai atualizar a tela com os dados reais assim que chegarem. Se a busca real falhar mas já havia dados de cache na tela, esses dados **continuam visíveis** — o usuário só é avisado que a atualização não funcionou, em vez de a tela ficar vazia.
 
@@ -456,6 +477,8 @@ class LabelElidavel(QLabel):
 
 Resolve o problema de nomes de produto muito grandes desalinhando a tela: em vez de um `QLabel` comum (que cresce sem limite e empurra o resto do layout), esse `QLabel` guarda o texto completo internamente (`_texto_completo`) e, toda vez que é redesenhado ou redimensionado, calcula — via `QFontMetrics.elidedText` — a versão truncada com reticências (`"Empresa › Nome de produto gigan…"`) que cabe na largura atual do widget. O texto original nunca é perdido: fica sempre disponível como tooltip ao passar o mouse por cima. É usado no título "Empresa › Produto" da tela de compras (`ProductEntriesPage`, ver [Seção 8](#8-página-3--compras-de-um-produto-producteentriespage)), que antes era um `QLabel` normal.
 
+🆕⁷ O construtor faz `setTextFormat(Qt.TextFormat.PlainText)`: o nome do produto vem da planilha (editável pelo usuário) e da IA, e sem isso um nome com cara de HTML (`"<b>...`, `"<img src=x>"`) seria interpretado como rich text pelo `QLabel`.
+
 🆕³ **Bug da primeira versão, e por que `minimumSizeHint()` precisou ser sobrescrito:** só truncar no `resizeEvent` não bastava. Por padrão, o `minimumSizeHint()` de um `QLabel` acompanha o **texto atual** do label. No instante em que o `LabelElidavel` é construído, ele ainda não tem pai nem está dentro de nenhum layout — nesse momento, `self.width()` reflete o tamanho padrão de uma janela solta (bem maior que o espaço real disponível depois), então a primeira tentativa de eliminar não corta nada, e o texto completo (grande) fica gravado como o texto "oficial" do label. A partir daí, o `minimumSizeHint()` do Qt reporta esse texto grande como o tamanho mínimo — e o layout, por definição, nunca entrega a um widget menos espaço do que o mínimo dele. Resultado: o `resizeEvent` nunca chega a ser chamado com uma largura pequena o bastante pra truncar de verdade, e a tela volta a ficar torta. A correção foi sobrescrever `minimumSizeHint()` para **nunca** depender do texto atual — ele sempre devolve só a largura de `"..."`, liberando o layout para espremer esse rótulo à vontade. É esse espremer que dispara o `resizeEvent` com a largura real disponível, e só aí a elisão de fato acontece.
 
 ### Tabela com navegação por Enter (`TabelaComNavegacaoEnter`) 🆕²
@@ -492,6 +515,20 @@ Ao confirmar uma célula em edição, o Qt avisa a view **qual tecla motivou o f
 Essa classe substitui o `QTableWidget` usado na tabela de compras (`self.tabela`, dentro de `ProductEntriesPage._montar_ui`, ver [Seção 8](#8-página-3--compras-de-um-produto-producteentriespage)).
 
 🆕³ **Bug da primeira versão, e o porquê do `_HINT_ENTER`:** a primeira tentativa comparava o hint recebido com `QAbstractItemDelegate.EndEditHint.EditNextItem` (o hint oficialmente documentado para a tecla Tab) — mas testando na prática, o hint que o Enter realmente dispara é outro. Pior: o *nome* desse hint na enumeração do Python varia por versão do binding PyQt6 — na documentação oficial (e em versões mais novas do PyQt6) ele se chama `SubmitModelData`, mas em versões mais antigas existe um erro de digitação conhecido no binding, e o mesmo hint aparece com o nome `SubmitModelCache`. Como `if hint != EditNextItem` nunca era verdadeiro pro Enter, o código simplesmente caía no comportamento padrão do Qt (nada acontecia) — daí o Enter "não fazer nada" ao ser apertado na coluna Data. A correção usa `getattr(..., "SubmitModelData", None) or ...SubmitModelCache` para resolver o hint certo em tempo de importação, tentando primeiro o nome oficial e caindo para o nome com erro de digitação se o oficial não existir nessa instalação — funcionando nas duas versões do binding.
+
+### 🆕⁶ Base das telas cheias (`PaginaBase`)
+
+As três telas cheias — `ProductEntriesPage`, `ImportarNotaFiscalPage` e `ProductListPage` — copiavam o mesmo encanamento. Agora todas herdam de `PaginaBase(QWidget)`, que reúne:
+
+| Membro | O que faz |
+|---|---|
+| `_workers_ativos` / `_disparar_worker(fn, *args, ao_concluir=)` | Dispara um `SheetsWorker` e o mantém numa lista até terminar — referência forte pra uma segunda chamada em paralelo não fazer a primeira `QThread` (ainda rodando, sem dono) ser coletada no meio e derrubar o app. Ao terminar, o worker sai da lista e `ao_concluir` é chamado. |
+| `_destruida` / `marcar_destruida()` | A `MainWindow` chama `marcar_destruida()` antes de destruir uma página; os callbacks de rede atrasados checam `self._destruida` e desistem em vez de mexer em widgets já apagados (`RuntimeError: wrapped C/C++ object ... has been deleted`). `ProductListPage` é reaproveitada (nunca destruída), então herda a flag mas não a usa. |
+| `_definir_ocupado(ocupado, mensagem="")` | Liga/desliga `_operacao_em_andamento` e desabilita os botões de `_botoes_bloqueaveis()` (cada página sobrescreve essa tupla); opcionalmente escreve `mensagem` no `status_label`. |
+| `_texto_celula(row, col)` | Texto de uma célula da `self.tabela`, já com `.strip()`, ou `""`. |
+| `_estilo_botao_destaque()` | O CSS do botão primário na cor da empresa. |
+
+As referências a `_disparar_worker`/`_destruida`/etc. nas seções abaixo continuam válidas — só o **lugar** onde estão definidos mudou (de cada página pra `PaginaBase`).
 
 ---
 
@@ -918,7 +955,9 @@ Um resumo visual de tudo o que foi explicado, seguindo o caminho de "abrir a emp
 
 ```python
 def main():
+    migrar_cache_antigo()                        # 🆕⁶
     app = QApplication(sys.argv)
+    app.setApplicationName("Controle de Empresas")  # 🆕⁶
     app.setStyle("Fusion")
     aplicar_tema_escuro(app)   # 🆕⁵
     janela = MainWindow()
@@ -930,7 +969,8 @@ if __name__ == "__main__":
     main()
 ```
 
-- `QApplication(sys.argv)` inicializa o motor do Qt — é obrigatório existir exatamente uma instância dessa classe antes de criar qualquer widget.
+- 🆕⁶ `migrar_cache_antigo()` move o cache da pasta antiga (`<script>/cache`) pra nova pasta por-usuário, uma vez (ver [Seção 5](#5-cache-local-em-disco-)).
+- `QApplication(sys.argv)` inicializa o motor do Qt — é obrigatório existir exatamente uma instância dessa classe antes de criar qualquer widget. 🆕⁶ `setApplicationName` dá um nome ao app que o Qt usa nos títulos de diálogos nativos (abrir arquivo, etc.).
 - `app.setStyle("Fusion")` aplica um tema visual consistente entre Windows e Linux (em vez do estilo nativo de cada sistema operacional, que varia bastante).
 - 🆕⁵ `aplicar_tema_escuro(app)` monta um `QPalette` escuro fixo (janela, base das tabelas, texto, botões, seleção, além das cores do grupo `Disabled`) e aplica com `app.setPalette(...)`. O objetivo é o app ficar **sempre** com o mesmo visual escuro, independente do tema (claro/escuro) do sistema ou do ambiente onde for executado — antes, num sistema em tema claro, os campos ficavam com texto claro sobre fundo claro em alguns lugares. As cores de destaque de cada empresa (cabeçalhos de tabela, botões primários) continuam vindo de `COMPANIES`, por cima dessa paleta.
 - `janela.show()` exibe a `MainWindow` (que por sua vez mostra a `CompanySelectPage`, a primeira tela do `QStackedWidget`).
@@ -1265,18 +1305,21 @@ def carregar_config() -> dict:
         return {}
 
 
-def salvar_config(dados: dict) -> None:
+def salvar_config(dados: dict) -> None:      # 🆕⁷ escrita atômica + 0600 desde o os.open
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as arquivo:
+    temporario = CONFIG_PATH + ".tmp"
+    fd = os.open(temporario, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as arquivo:
         json.dump(dados, arquivo, ensure_ascii=False, indent=2)
+    os.replace(temporario, CONFIG_PATH)      # troca atômica
     try:
         os.chmod(CONFIG_PATH, 0o600)
     except OSError:
         pass
 ```
 
-- `carregar_config` nunca levanta exceção: se o arquivo não existe, está corrompido ou é um JSON que não é objeto, devolve `{}` — nesse caso o app abre mas não carrega nenhuma empresa até a URL da planilha ser configurada.
-- `salvar_config` grava com **permissão `600`** (só o dono lê), pra os segredos (URL da planilha e chave da API) não ficarem legíveis pra outros usuários da máquina. Em sistemas de arquivos sem permissões POSIX (pen drive, etc.) o `chmod` falha silenciosamente e o app segue.
+- `carregar_config` nunca levanta exceção: se o arquivo não existe, está corrompido ou é um JSON que não é objeto, devolve `{}` — nesse caso o app abre mas não carrega nenhuma empresa até a URL da planilha ser configurada. Pode ser chamada de várias threads (a leitura da nota roda num `SheetsWorker`).
+- 🆕⁷ `salvar_config` grava **num arquivo temporário e faz `os.replace`** (troca atômica): um `carregar_config` concorrente vê a versão antiga inteira ou a nova inteira, nunca um JSON truncado. O arquivo já nasce com `os.open(..., 0o600)` — antes havia uma janela entre criar com o umask (tipicamente `644`) e o `chmod` posterior. Em sistemas de arquivos sem permissões POSIX (pen drive) o `chmod` falha silenciosamente e o app segue.
 
 Chaves gravadas no `config.json`: `sheets_webhook_url`, `gemini_api_key`, `gemini_modelo`.
 
@@ -1329,7 +1372,7 @@ Valida que há chave configurada, lê os bytes da imagem, recusa arquivo vazio o
 
 Para NFC-e: a nota traz um QR code que aponta pra página oficial de consulta da SEFAZ, com **todos os itens e preços exatos** — mais confiável que ler a foto. A função:
 
-1. valida que a URL começa com `http://`/`https://`;
+1. valida que a URL começa com `http://`/`https://` e **recusa endereços de rede interna** (`_recusar_host_interno`: `localhost`, `.local`, e IPs de loopback / privados / link-local / reservados) — 🆕⁷ o link é digitado pelo usuário e o fetch acontece na máquina dele, então isso barra um link colado por engano que faria o app sondar a rede local. *(Não cobre DNS rebinding — um domínio que resolve pra IP interno; pra um app local de um usuário só, o risco disso é baixo.)*
 2. baixa a página com um `User-Agent` de navegador (alguns portais bloqueiam clientes "estranhos"), lendo no máximo 4 MB;
 3. reduz o HTML a texto puro com `_texto_de_html` (tira `<script>`/`<style>`/`<noscript>`, remove todas as tags, desescapa entidades, colapsa espaços);
 4. se o texto vier muito curto **e** contiver palavras de tela de CAPTCHA/"não sou um robô"/"habilite o javascript", levanta `ErroIA` explicando que aquele estado (Santa Catarina, por exemplo) protege a consulta com um desafio que o app não passa — e que a saída é a importação por foto;
@@ -1421,9 +1464,11 @@ Levantamento acumulado das revisões 🆕⁵. Nenhum item é um crash garantido 
   1. Feito: a URL saiu do código (`sheets_webhook_url()`, config.json / variável de ambiente) — commits novos ficam limpos.
   2. **Recomendado: rotacionar a URL.** No editor do Apps Script, crie uma **nova implantação** (gera uma URL nova) e **arquive/exclua a antiga** — isso mata a URL vazada. Depois cole a nova em "⚙️ Configurar".
   3. Opcional: reescrever o histórico (`git filter-repo` + `push --force`) pra apagar a URL dos commits antigos. Só vale a pena junto com o passo 2.
-- **A chave da API do Gemini nunca esteve no repositório** — sempre foi lida de `~/.config/.../config.json` (permissão `600`) ou da variável de ambiente. OK.
-- **`.gitignore` está fora do versionamento.** Ele protege `cache/` (que guarda dados reais de compra e até uma foto de nota — `_ultima_nota_corrigida.jpg`). Enquanto não for commitado, um clone novo não ignora `cache/` e é fácil commitar esses dados sem querer. Recomendado versionar o `.gitignore`.
-- **`ler_nota_fiscal_link` busca uma URL arbitrária informada pelo usuário** e manda o texto pro Gemini. Como é um app local de um usuário só, que digita a própria URL, o risco é baixo — mas não há allowlist de domínios da SEFAZ; um link malicioso colado por engano faria o app buscar aquele endereço.
+- **A chave da API do Gemini nunca esteve no repositório** — sempre foi lida do `config.json` (permissão `600`) ou da variável de ambiente. OK.
+- 🆕⁵ **`.gitignore` versionado** — passou a ser commitado; ignora `cache/`, `build/`, `dist/` e `config.json`, pra dados de compra, saída de build e segredos não entrarem no repo por acidente.
+- 🆕⁷ **`ler_nota_fiscal_link` — mitigado em parte.** Ainda não há allowlist de domínios da SEFAZ (são dezenas, um por estado), mas `_recusar_host_interno` agora barra `localhost` e IPs de rede interna. Resíduo: DNS rebinding (domínio → IP interno) e redirects não são checados — aceitável pro perfil "app local de um usuário só".
+- 🆕⁷ **Escrita de config atômica** — `salvar_config` grava em `.tmp` + `os.replace` e abre já com `0600`; some a janela de permissão frouxa e o risco de leitura de JSON truncado por outra thread.
+- 🆕⁷ **`LabelElidavel` força texto puro** — nome de produto/empresa vindo da planilha ou da IA não é mais interpretado como rich text pelo QLabel.
 
 ### Código morto / incompleto
 
@@ -1442,7 +1487,52 @@ Levantamento acumulado das revisões 🆕⁵. Nenhum item é um crash garantido 
 - **`ConfigDialog._buscar_modelos` faz a chamada de rede na thread da interface** — a janela congela por até 30s se a API demorar. As leituras de nota já rodam em thread; esse diálogo não.
 - **Quantidade/preço da IA aparecem como `2.0` / `12.9` na tabela de conferência** (repr de float). Cosmético.
 - **`apps_script_backend.gs` está sem quebra de linha no fim do arquivo** (`\ No newline at end of file`). Trivial.
-- **Portabilidade (pra virar app distribuído):** `CACHE_DIR`/`CONFIG_DIR` e o carregamento de `assets/` assumem execução a partir do `.py`; empacotado com PyInstaller (`__file__` vira pasta temporária, e no Windows a pasta do executável costuma ser somente-leitura) isso quebra. Ver o plano de refatoração para pacote.
+- 🆕⁶ **Portabilidade — resolvido:** `assets/` agora passa por `resource_path()` e `config`/`cache` foram pra pastas por-usuário do SO. Ver [Seção 21](#21-empacotamento-e-instalação-).
+- 🆕⁶ **Build/CI não testados neste ambiente:** o `.spec`, o `.github/workflows/build.yml` e o código frozen-safe foram escritos, mas o primeiro `.exe`/binário e a primeira execução do workflow precisam rodar no GitHub Actions ou numa máquina com PyInstaller — não deu pra validar aqui.
+
+---
+
+## 21. Empacotamento e instalação 🆕⁶ 🆕⁷
+
+O objetivo é o usuário final receber **um arquivo** e dar duplo clique — sem instalar Python. O `Readme.md` tem o passo a passo com telas; aqui fica o resumo técnico.
+
+### Instalar (usuário final)
+
+| Sistema | Jeito mais fácil | Pelo código-fonte |
+|---|---|---|
+| **Windows** | Releases → baixar `ControleEmpresas-windows.exe` → duplo clique (no aviso do SmartScreen: "Mais informações" → "Executar assim mesmo"). | Instalar Python 3.10+ com "Add to PATH"; `pip install PyQt6`; `python controle_empresas.py`. |
+| **Linux** | Releases → baixar `ControleEmpresas-linux` → `chmod +x` → `./ControleEmpresas-linux`. Se faltar lib: `sudo apt install libxcb-cursor0 libxcb-xinerama0 libegl1`. | `sudo apt install python3-pyqt6` (ou pip num venv); `python3 controle_empresas.py`. |
+
+Depois: **"⚙️ Configurar"** → colar a URL do Web App do Apps Script (e, opcional, a chave do Gemini). Fica em `config.json` na pasta de config do usuário (Seção 2) — atualizar o app não apaga.
+
+### Arquivos de build
+
+- **`controle_empresas.spec`** — receita do PyInstaller. `datas=[('assets', 'assets')]` embute as logos; `console=False` (app de janela); `excludes=[...]` corta libs não usadas pra o binário não inchar.
+- **`requirements.txt`** — `PyQt6` (execução) + `pyinstaller` (build).
+- **`.github/workflows/build.yml`** — 🆕⁷ CI: a cada tag `v*` (`git tag v1.0 && git push origin v1.0`), o GitHub roda `pyinstaller` no Windows **e** no Linux e anexa os dois executáveis numa Release. Também dá pra disparar na mão em *Actions → build → Run workflow*. A publicação usa `gh release create/upload` (CLI oficial, sem action de terceiros) com `permissions: contents: write`.
+
+### Build manual
+
+```
+pip install -r requirements.txt
+pyinstaller controle_empresas.spec      # -> dist/ControleEmpresas(.exe)
+```
+
+O PyInstaller **não faz cross-compile**: pra um `.exe` de Windows, rodar dentro do Windows. O mesmo `.spec` gera um binário Linux no Linux.
+
+### O que o código precisou pra funcionar empacotado (ver [Seção 2](#2-configuração-inicial))
+
+1. **`resource_path()`** — empacotado (`getattr(sys, "frozen", False)`), os assets estão em `sys._MEIPASS`, não ao lado do `.py`.
+2. **Config e cache em pasta por-usuário** — no Windows a pasta do `.exe` costuma ser somente-leitura; gravar lá falharia. Vão pra `%APPDATA%` / `%LOCALAPPDATA%`.
+3. **`migrar_cache_antigo()`** (Seção 5) — transição suave pra quem já rodava do `.py`.
+4. **`app.setApplicationName("Controle de Empresas")`** no `main()` — usado pelo Qt em títulos de diálogos nativos.
+
+### Ainda dá pra melhorar (futuro)
+
+- Ícone próprio (`.ico`) no `.spec`.
+- Instalador de verdade (Inno Setup / MSIX) — atalho no Menu Iniciar, desinstalador.
+- Assinar o executável, pra o SmartScreen não reclamar.
+- **Build não validado neste ambiente:** não há PyInstaller aqui; o `.spec`, o `.yml` e o código frozen-safe foram escritos, mas o primeiro build real precisa rodar no CI ou numa máquina com PyInstaller.
 
 ---
 
@@ -1479,4 +1569,8 @@ Levantamento acumulado das revisões 🆕⁵. Nenhum item é um crash garantido 
 | 🆕⁵ **`sugerir_pasta`** | Sugere a pasta de destino de um item lido comparando as palavras do nome com as pastas existentes (limiar 0.6) |
 | 🆕⁵ **`ImportarNotaFiscalPage`** | Tela de conferência dos itens que a IA leu de uma nota; nada vai pro Sheets sem o usuário revisar e clicar em "✅ Confirmar tudo" |
 | 🆕⁵ **`renomearProdutos`** | Ação do backend (e `sheets_renomear_produtos` no Python) que renomeia pasta/nome por ID — implementada, mas ainda sem tela que a use |
+| 🆕⁶ **`PaginaBase`** | Classe base das três telas cheias; reúne o encanamento antes triplicado (`_disparar_worker`, `_destruida`/`marcar_destruida`, `_definir_ocupado` + `_botoes_bloqueaveis`, `_texto_celula`, `_estilo_botao_destaque`) |
+| 🆕⁶ **`resource_path()`** | Resolve um recurso somente-leitura que acompanha o app (as logos); sabe achar tanto rodando do `.py` quanto empacotado (`sys._MEIPASS`) |
+| 🆕⁶ **Pasta por-usuário** | `config.json` e cache ficam em `%APPDATA%`/`%LOCALAPPDATA%` (Windows) ou `~/.config`/`~/.cache` (Linux), nunca ao lado do executável — que no Windows costuma ser somente-leitura |
+| 🆕⁶ **`.spec` (PyInstaller)** | `controle_empresas.spec`: receita que gera `dist/ControleEmpresas(.exe)`, um arquivo só, com os assets embutidos |
 | 🆕⁴ **`LockService`** | Serviço do Apps Script usado em `doPost` pra impedir que duas requisições de escrita rodem ao mesmo tempo e disputem os mesmos números de linha |
